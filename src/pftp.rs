@@ -87,7 +87,8 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
     message.extend_from_slice(&operation);
 
     // Split the message into RFC76 frames and write them. The first frame has
-    // the `next` bit clear; subsequent frames set it.
+    // the `next` bit clear; subsequent frames set it. The Polar PFTP MTU
+    // characteristic expects write-without-response for these data frames.
     let mtu_size = mtu_size(device).await;
     let mut seq = 0u8;
     let mut offset = 0usize;
@@ -103,7 +104,7 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
         frame.extend_from_slice(&message[offset..offset + chunk_len]);
 
         device
-            .write(&mtu, &frame, WriteType::WithResponse)
+            .write(&mtu, &frame, WriteType::WithoutResponse)
             .await
             .map_err(Error::BleError)?;
 
@@ -121,10 +122,17 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
     let mut payload = Vec::new();
 
     loop {
-        let data = match notifications.next().await {
-            Some(d) if d.uuid == PSFTP_MTU_UUID => d.value,
-            Some(_) => continue,
-            None => return Err(Error::InvalidData),
+        // Guard against a device that never responds: time out after 10s.
+        let data = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            notifications.next(),
+        )
+        .await
+        {
+            Ok(Some(d)) if d.uuid == PSFTP_MTU_UUID => d.value,
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err(Error::InvalidData),
+            Err(_) => return Err(Error::InvalidData),
         };
 
         if data.is_empty() {
@@ -141,6 +149,10 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
                 } else {
                     0
                 };
+                // error code 0 means the request succeeded.
+                if code == 0 {
+                    break;
+                }
                 return Err(Error::PftpError(code));
             }
             STATUS_LAST | STATUS_MORE => {
