@@ -49,7 +49,7 @@ use std::fmt;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
-pub use offline::{OfflineRecord, PpiSample};
+pub use offline::{OfflineRecord, PpiRecord, PpiSample};
 pub use polar_uuid::MeasurementType;
 
 /// Error type for general errors and BLE errors from btleplug
