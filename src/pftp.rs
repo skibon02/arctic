@@ -18,56 +18,182 @@ const STATUS_ERROR_OR_RESPONSE: u8 = 0x00;
 const STATUS_LAST: u8 = 0x01;
 const STATUS_MORE: u8 = 0x03;
 
-/// Path of the file listing all offline recordings
-const PMD_FILES_PATH: &str = "/PMDFILES.TXT";
+/// Root directory holding offline recordings on the device
+const RECORDINGS_ROOT: &str = "/U/0/";
 
-/// Lists offline recordings by fetching and parsing the PMDFILES.TXT index.
+/// Lists offline recordings by walking the device's directory tree.
+///
+/// The Verity Sense stores recordings under `/U/0/<date8>/R/<time6>/<TYPE><n>.REC`.
+/// Each directory level is read with a PFTP GET that returns a protobuf
+/// `PbPFtpDirectory` listing its entries.
 pub(crate) async fn list_offline_recordings(
     device: &Peripheral,
 ) -> PolarResult<Vec<OfflineRecord>> {
-    let data = get_file(device, PMD_FILES_PATH).await?;
-    let text = String::from_utf8_lossy(&data);
-
     let mut records = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+
+    // A device with no recordings reports error 103 (NO_SUCH_FILE_OR_DIRECTORY)
+    // for the root directory, which we treat as an empty list.
+    let dates = match list_directory(device, RECORDINGS_ROOT).await {
+        Ok(entries) => entries,
+        Err(Error::PftpError(103)) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    for (date, _) in dates {
+        // Skip entries that are not 8-digit date directories.
+        if date.len() != 9 || !date.ends_with('/') {
             continue;
         }
-        // Each line: "<size> <path>"
-        let mut parts = line.splitn(2, ' ');
-        let size: u64 = match parts.next().and_then(|s| s.parse().ok()) {
-            Some(s) => s,
-            None => continue,
-        };
-        let path = match parts.next() {
-            Some(p) => p.trim().to_string(),
-            None => continue,
-        };
 
-        // Path format: /U/0/<date8>/R/<time6>/<TYPE><n>.REC
-        let components: Vec<&str> = path.split('/').collect();
-        if components.len() < 6 {
-            continue;
+        let date_path = format!("{}{}", RECORDINGS_ROOT, date);
+        let subs = list_directory(device, &date_path).await?;
+        for (sub, _) in subs {
+            if sub != "R/" {
+                continue;
+            }
+
+            let time_path = format!("{}{}", date_path, sub);
+            let times = list_directory(device, &time_path).await?;
+            for (time, _) in times {
+                if time.len() != 7 || !time.ends_with('/') {
+                    continue;
+                }
+
+                let rec_path = format!("{}{}", time_path, time);
+                let files = list_directory(device, &rec_path).await?;
+                for (name, size) in files {
+                    if !name.ends_with(".REC") {
+                        continue;
+                    }
+                    let prefix: String =
+                        name.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+                    let ty = match MeasurementType::from_file_prefix(&prefix) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+
+                    records.push(OfflineRecord {
+                        path: format!("{}{}", rec_path, name),
+                        size,
+                        ty,
+                    });
+                }
+            }
         }
-        let file_name = components[5];
-        let prefix: String = file_name
-            .chars()
-            .take_while(|c| c.is_ascii_alphabetic())
-            .collect();
-        let ty = match MeasurementType::from_file_prefix(&prefix) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        records.push(OfflineRecord {
-            path,
-            size,
-            ty,
-        });
     }
 
     Ok(records)
+}
+
+/// Lists the entries of a directory via a PFTP GET and parses the returned
+/// `PbPFtpDirectory` protobuf into `(name, size)` pairs.
+async fn list_directory(device: &Peripheral, path: &str) -> PolarResult<Vec<(String, u64)>> {
+    let data = get_file(device, path).await?;
+    parse_directory(&data)
+}
+
+/// Parses a `PbPFtpDirectory` protobuf message.
+///
+/// The message is a repeated field of `PbPFtpEntry` messages (field 1,
+/// length-delimited). Each entry has a name (field 1, length-delimited) and a
+/// size (field 2, varint).
+fn parse_directory(data: &[u8]) -> PolarResult<Vec<(String, u64)>> {
+    let mut entries = Vec::new();
+    let mut pos = 0;
+
+    while pos < data.len() {
+        // Each entry is wrapped in a field 1 length-delimited tag.
+        if data[pos] != 0x0A {
+            return Err(Error::InvalidData);
+        }
+        pos += 1;
+        let (len, next) = read_varint(data, pos)?;
+        pos = next;
+        let end = pos + len as usize;
+        if end > data.len() {
+            return Err(Error::InvalidData);
+        }
+
+        entries.push(parse_entry(&data[pos..end])?);
+        pos = end;
+    }
+
+    Ok(entries)
+}
+
+/// Parses a single `PbPFtpEntry` message into a `(name, size)` pair.
+fn parse_entry(data: &[u8]) -> PolarResult<(String, u64)> {
+    let mut name = String::new();
+    let mut size = 0u64;
+    let mut cursor = 0;
+
+    while cursor < data.len() {
+        let tag = data[cursor];
+        let field = tag >> 3;
+        let wire_type = tag & 0x07;
+        cursor += 1;
+
+        match (field, wire_type) {
+            // name (field 1, length-delimited)
+            (1, 2) => {
+                let (len, next) = read_varint(data, cursor)?;
+                cursor = next;
+                let end = cursor + len as usize;
+                if end > data.len() {
+                    return Err(Error::InvalidData);
+                }
+                name = String::from_utf8_lossy(&data[cursor..end]).to_string();
+                cursor = end;
+            }
+            // size (field 2, varint)
+            (2, 0) => {
+                let (value, next) = read_varint(data, cursor)?;
+                cursor = next;
+                size = value;
+            }
+            // Unknown field: skip it.
+            (_, 0) => {
+                let (_, next) = read_varint(data, cursor)?;
+                cursor = next;
+            }
+            (_, 2) => {
+                let (len, next) = read_varint(data, cursor)?;
+                cursor = next + len as usize;
+                if cursor > data.len() {
+                    return Err(Error::InvalidData);
+                }
+            }
+            _ => return Err(Error::InvalidData),
+        }
+    }
+
+    Ok((name, size))
+}
+
+/// Reads a base-128 varint starting at `pos`, returning its value and the
+/// offset just past it.
+fn read_varint(data: &[u8], pos: usize) -> PolarResult<(u64, usize)> {
+    let mut value = 0u64;
+    let mut shift = 0;
+    let mut cursor = pos;
+
+    loop {
+        if cursor >= data.len() {
+            return Err(Error::InvalidData);
+        }
+        let byte = data[cursor];
+        cursor += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(Error::InvalidData);
+        }
+    }
+
+    Ok((value, cursor))
 }
 
 /// Downloads a file from the device over PS-FTP.
@@ -85,6 +211,9 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
     message.push((operation.len() & 0xff) as u8);
     message.push(((operation.len() >> 8) & 0x7f) as u8);
     message.extend_from_slice(&operation);
+
+    // Get the notification stream before writing so the response is not missed.
+    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
 
     // Split the message into RFC76 frames and write them. The first frame has
     // the `next` bit clear; subsequent frames set it. The Polar PFTP MTU
@@ -118,7 +247,6 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
     }
 
     // Read the response frames and reassemble the payload.
-    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
     let mut payload = Vec::new();
 
     loop {
@@ -184,4 +312,53 @@ async fn mtu_size(_device: &Peripheral) -> usize {
     // btleplug does not expose the negotiated MTU directly; use a conservative
     // value that works across platforms.
     23
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn parses_directory_entries() {
+        // Two PbPFtpEntry messages wrapped in the repeated field:
+        //   { name: "20250101/", size: 123 }
+        //   { name: "PPI00.REC", size: 456 }
+        let entry1 = {
+            let mut e = Vec::new();
+            e.push(0x0A); // name field
+            e.push(9);
+            e.extend_from_slice(b"20250101/");
+            e.push(0x10); // size field
+            e.push(123);
+            e
+        };
+        let entry2 = {
+            let mut e = Vec::new();
+            e.push(0x0A);
+            e.push(9);
+            e.extend_from_slice(b"PPI00.REC");
+            e.push(0x10);
+            e.push(0xC8); // 456 = varint 0xC8 0x03
+            e.push(0x03);
+            e
+        };
+
+        let mut data = Vec::new();
+        data.push(0x0A); // repeated entries field 1
+        data.push(entry1.len() as u8);
+        data.extend_from_slice(&entry1);
+        data.push(0x0A);
+        data.push(entry2.len() as u8);
+        data.extend_from_slice(&entry2);
+
+        let entries = parse_directory(&data).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], ("20250101/".to_string(), 123));
+        assert_eq!(entries[1], ("PPI00.REC".to_string(), 456));
+    }
+
+    #[test]
+    fn parses_empty_directory() {
+        assert!(parse_directory(&[]).unwrap().is_empty());
+    }
 }

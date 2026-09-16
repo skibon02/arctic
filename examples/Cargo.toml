@@ -2,4 +2,6 @@
 
 members = [
 	"offline-ppi",
+	"discover-record",
+	"list-recordings",
 ]

@@ -13,9 +13,17 @@ use futures::stream::StreamExt;
 /// Control point command opcodes (client to service)
 const REQUEST_MEASUREMENT_START: u8 = 0x02;
 const STOP_MEASUREMENT: u8 = 0x03;
+const GET_MEASUREMENT_STATUS: u8 = 0x05;
 
 /// Bit set in the type byte to request offline (vs online) recording
 const OFFLINE_BIT: u8 = 0x80;
+
+/// Mask for the measurement type id in a status response byte
+const MEASUREMENT_TYPE_MASK: u8 = 0x3F;
+/// Mask for the active state in a status response byte
+const ACTIVE_STATE_MASK: u8 = 0xC0;
+/// Active state value indicating an offline recording is running
+const OFFLINE_ACTIVE: u8 = 0x80;
 
 /// Control point response marker byte
 const CP_RESPONSE: u8 = 0xF0;
@@ -39,15 +47,39 @@ pub(crate) async fn start_offline_recording(
     }
 
     let response = send_command(device, command).await?;
-    ensure_success(response)?;
+    ensure_success(&response)?;
     Ok(())
 }
 
 /// Stops the measurement of the given type.
 pub(crate) async fn stop_measurement(device: &Peripheral, ty: MeasurementType) -> PolarResult<()> {
     let response = send_command(device, vec![STOP_MEASUREMENT, ty.as_u8()]).await?;
-    ensure_success(response)?;
+    ensure_success(&response)?;
     Ok(())
+}
+
+/// Queries the device for the currently active measurements.
+///
+/// Returns the raw parameter bytes of the response, each encoding a measurement
+/// type (low 6 bits) and its active state (high 2 bits).
+pub(crate) async fn get_measurement_status(device: &Peripheral) -> PolarResult<Vec<u8>> {
+    let response = send_command(device, vec![GET_MEASUREMENT_STATUS]).await?;
+    ensure_success(&response)?;
+    Ok(response.parameters)
+}
+
+/// Returns whether an offline recording of the given type is currently active.
+pub(crate) async fn is_offline_recording_active(
+    device: &Peripheral,
+    ty: MeasurementType,
+) -> PolarResult<bool> {
+    let status = get_measurement_status(device).await?;
+    let type_byte = ty.as_u8();
+
+    Ok(status.iter().any(|byte| {
+        (byte & MEASUREMENT_TYPE_MASK) == type_byte
+            && (byte & ACTIVE_STATE_MASK) == OFFLINE_ACTIVE
+    }))
 }
 
 /// Writes a command to the PMD control point and waits for the response.
@@ -60,16 +92,17 @@ async fn send_command(device: &Peripheral, command: Vec<u8>) -> PolarResult<Cont
 
     // The PMD data characteristic must also be subscribed before the control
     // point accepts commands.
-    if let Ok(data_char) = find_characteristic(device, PMD_DATA_UUID).await {
-        let _ = device.subscribe(&data_char).await;
-    }
+    let data_char = find_characteristic(device, PMD_DATA_UUID).await?;
+    device.subscribe(&data_char).await.map_err(Error::BleError)?;
+
+    // Get the notification stream before writing so the response is not missed.
+    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
 
     device
         .write(&characteristic, &command, WriteType::WithResponse)
         .await
         .map_err(Error::BleError)?;
 
-    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
     loop {
         let data = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -90,6 +123,7 @@ async fn send_command(device: &Peripheral, command: Vec<u8>) -> PolarResult<Cont
 /// A parsed response from the PMD control point.
 struct ControlResponse {
     error_code: u8,
+    parameters: Vec<u8>,
 }
 
 impl ControlResponse {
@@ -98,13 +132,19 @@ impl ControlResponse {
         if data.len() < 4 || data[0] != CP_RESPONSE {
             return Err(Error::InvalidData);
         }
+        let parameters = if data.len() > 5 {
+            data[5..].to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(ControlResponse {
             error_code: data[3],
+            parameters,
         })
     }
 }
 
-fn ensure_success(response: ControlResponse) -> PolarResult<()> {
+fn ensure_success(response: &ControlResponse) -> PolarResult<()> {
     if response.error_code == 0 {
         Ok(())
     } else {

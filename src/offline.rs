@@ -13,6 +13,8 @@ const OFFLINE_HEADER_LENGTH: usize = 16;
 const DATE_TIME_LENGTH: usize = 20;
 /// Size of a single PPI sample in bytes
 const PPI_SAMPLE_CHUNK: usize = 6;
+/// Size of the PMD data frame header prepended to each frame's samples
+const PMD_FRAME_HEADER_LENGTH: usize = 10;
 
 /// Security strategies supported for offline recordings
 enum SecurityStrategy {
@@ -147,13 +149,17 @@ pub(crate) fn parse_ppi_record(data: &[u8], secret: Option<&[u8]>) -> PolarResul
 
     // Parse PPI data frames. The first frame length is the packet size read
     // from the metadata; each subsequent frame is preceded by a 2-byte length.
+    // Each frame begins with a 10-byte PMD header (measurement type, timestamp,
+    // frame type) followed by the raw PPI samples.
     let mut samples = Vec::new();
     let mut pos = 0;
     let mut frame_size = packet_size;
     while pos < payload.len() && frame_size > 0 {
         let frame_end = (pos + frame_size).min(payload.len());
         let frame = &payload[pos..frame_end];
-        samples.extend(parse_ppi_frame(frame)?);
+        if frame.len() > PMD_FRAME_HEADER_LENGTH {
+            samples.extend(parse_ppi_frame(&frame[PMD_FRAME_HEADER_LENGTH..])?);
+        }
         pos = frame_end;
 
         // Read the next frame's length if present.

@@ -43,8 +43,9 @@ mod offline;
 mod pftp;
 mod polar_uuid;
 
-use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral};
+use futures::stream::StreamExt;
 use std::fmt;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
@@ -133,6 +134,30 @@ impl PolarSensor {
         })
     }
 
+    /// Scans for the first Polar Verity Sense and connects to it, regardless of
+    /// the device id this instance was created with.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Error::BleError`] if the bluetooth adapter, scan, or service
+    /// discovery fails. Returns [`Error::NoBleAdaptor`] if no adapters are
+    /// available, and [`Error::NoDevice`] if no Verity Sense was found.
+    pub async fn discover(&mut self) -> PolarResult<()> {
+        let central = self.scan().await?;
+
+        self.ble_device = self
+            .find_device_by(&central, |name| name.starts_with("Polar Sense"))
+            .await;
+
+        if let Some(device) = &self.ble_device {
+            device.connect().await.map_err(Error::BleError)?;
+            device.discover_services().await.map_err(Error::BleError)?;
+            return Ok(());
+        }
+
+        Err(Error::NoDevice)
+    }
+
     /// Finds and connects to the device id associated with this instance.
     ///
     /// # Errors
@@ -141,19 +166,14 @@ impl PolarSensor {
     /// discovery fails. Returns [`Error::NoBleAdaptor`] if no adapters are
     /// available, and [`Error::NoDevice`] if the device was not found.
     pub async fn connect(&mut self) -> PolarResult<()> {
-        let adapters = self.ble_manager.adapters().await.map_err(Error::BleError)?;
-        if adapters.is_empty() {
-            return Err(Error::NoBleAdaptor);
-        }
+        let central = self.scan().await?;
+        let device_id = self.device_id.clone();
 
-        let central = adapters.into_iter().next().unwrap();
-        central
-            .start_scan(ScanFilter::default())
-            .await
-            .map_err(Error::BleError)?;
-        time::sleep(Duration::from_secs(2)).await;
-
-        self.ble_device = self.find_device(&central).await;
+        self.ble_device = self
+            .find_device_by(&central, move |name| {
+                name.starts_with("Polar") && name.ends_with(&device_id)
+            })
+            .await;
 
         if let Some(device) = &self.ble_device {
             device.connect().await.map_err(Error::BleError)?;
@@ -205,6 +225,33 @@ impl PolarSensor {
         control::stop_measurement(self.device().await?, ty).await
     }
 
+    /// Queries the device for the currently active measurements.
+    ///
+    /// Returns the raw status bytes reported by the device, each encoding a
+    /// measurement type (low 6 bits) and its active state (high 2 bits).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::ControlPointError`] if the device rejects the request.
+    pub async fn get_measurement_status(&self) -> PolarResult<Vec<u8>> {
+        control::get_measurement_status(self.device().await?).await
+    }
+
+    /// Returns whether an offline recording of the given type is currently
+    /// active on the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::ControlPointError`] if the device rejects the request.
+    pub async fn is_offline_recording_active(
+        &self,
+        ty: MeasurementType,
+    ) -> PolarResult<bool> {
+        control::is_offline_recording_active(self.device().await?, ty).await
+    }
+
     /// Lists the offline recordings stored on the device.
     ///
     /// # Errors
@@ -242,21 +289,76 @@ impl PolarSensor {
         Err(Error::NoDevice)
     }
 
-    async fn find_device(&self, central: &Adapter) -> Option<Peripheral> {
-        for p in central.peripherals().await.unwrap() {
-            if let Some(props) = p.properties().await.unwrap() {
-                if props
-                    .local_name
-                    .iter()
-                    .any(|name| name.starts_with("Polar") && name.ends_with(&self.device_id))
-                {
-                    return Some(p);
-                }
-            }
+    /// Starts a scan on the first available adapter.
+    async fn scan(&self) -> PolarResult<Adapter> {
+        let adapters = self.ble_manager.adapters().await.map_err(Error::BleError)?;
+        if adapters.is_empty() {
+            return Err(Error::NoBleAdaptor);
         }
 
-        None
+        let central = adapters.into_iter().next().unwrap();
+        central
+            .start_scan(ScanFilter::default())
+            .await
+            .map_err(Error::BleError)?;
+
+        Ok(central)
     }
+
+    /// Scans for a device whose advertised local name matches `predicate`,
+    /// reacting to discovery events until a match is found or the scan times
+    /// out.
+    async fn find_device_by<F>(&self, central: &Adapter, predicate: F) -> Option<Peripheral>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut events = central.events().await.ok()?;
+        let deadline = time::Instant::now() + Duration::from_secs(10);
+
+        // Check peripherals already discovered before subscribing to events.
+        if let Some(device) = matching_peripheral(central, &predicate).await {
+            return Some(device);
+        }
+
+        loop {
+            let remaining = deadline.saturating_duration_since(time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+
+            let event = match time::timeout(remaining, events.next()).await {
+                Ok(Some(event)) => event,
+                _ => return None,
+            };
+
+            // Only re-check peripherals when a new device appears or updates.
+            match event {
+                CentralEvent::DeviceDiscovered(_) | CentralEvent::DeviceUpdated(_) => {}
+                _ => continue,
+            }
+
+            if let Some(device) = matching_peripheral(central, &predicate).await {
+                return Some(device);
+            }
+        }
+    }
+}
+
+/// Returns the first peripheral whose advertised local name matches
+/// `predicate`.
+async fn matching_peripheral<F>(central: &Adapter, predicate: &F) -> Option<Peripheral>
+where
+    F: Fn(&str) -> bool,
+{
+    for p in central.peripherals().await.ok()? {
+        if let Some(props) = p.properties().await.ok().flatten() {
+            if props.local_name.iter().any(|name| predicate(name)) {
+                return Some(p);
+            }
+        }
+    }
+
+    None
 }
 
 /// Private helper to find characteristics from a [`Uuid`]
