@@ -1,9 +1,9 @@
 [package]
 authors = ["Maiddog <maiddogsrl@gmail.com>", "BeaconBrigade <beaconbrigade@gmail.com>"]
-description = "A Rust libary for handling bluetooth Polar heart rate monitors"
+description = "A Rust library for offline PPI recording with Polar Verity Sense"
 documentation = "https://docs.rs/arctic"
 homepage = "https://github.com/Roughsketch/arctic"
-keywords = ["polar", "bluetooth", "heartrate"]
+keywords = ["polar", "bluetooth", "heartrate", "ppi"]
 license = "MIT"
 name = "arctic"
 readme = "README.md"
@@ -11,18 +11,15 @@ repository = "https://github.com/Roughsketch/arctic.git"
 version = "1.0.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "arctic"
 path = "src/lib.rs"
 
 [dependencies]
-async-trait = "0.1"
 btleplug = "0.11"
-chrono = "0.4"
 futures = "0.3"
-tokio = { version = "1.10.0", features = ["macros", "rt", "rt-multi-thread"] }
-tokio-stream = { version = "0.1", features = ["sync"]}
+tokio = { version = "1.10.0", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 uuid = "1"
 
 [dev-dependencies]
