@@ -3,7 +3,7 @@
 //! Commands sent over the PMD control point to start and stop offline
 //! recording.
 
-use crate::polar_uuid::{MeasurementType, PMD_CP_UUID};
+use crate::polar_uuid::{MeasurementType, PMD_CP_UUID, PMD_DATA_UUID};
 use crate::{find_characteristic, Error, PolarResult};
 
 use btleplug::api::{Peripheral as _, WriteType};
@@ -58,19 +58,33 @@ async fn send_command(device: &Peripheral, command: Vec<u8>) -> PolarResult<Cont
         .await
         .map_err(Error::BleError)?;
 
+    // The PMD data characteristic must also be subscribed before the control
+    // point accepts commands.
+    if let Ok(data_char) = find_characteristic(device, PMD_DATA_UUID).await {
+        let _ = device.subscribe(&data_char).await;
+    }
+
     device
         .write(&characteristic, &command, WriteType::WithResponse)
         .await
         .map_err(Error::BleError)?;
 
     let mut notifications = device.notifications().await.map_err(Error::BleError)?;
-    while let Some(data) = notifications.next().await {
+    loop {
+        let data = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            notifications.next(),
+        )
+        .await
+        {
+            Ok(Some(d)) => d,
+            Ok(None) => return Err(Error::InvalidData),
+            Err(_) => return Err(Error::InvalidData),
+        };
         if data.uuid == PMD_CP_UUID && data.value.first() == Some(&CP_RESPONSE) {
             return ControlResponse::new(&data.value);
         }
     }
-
-    Err(Error::InvalidData)
 }
 
 /// A parsed response from the PMD control point.

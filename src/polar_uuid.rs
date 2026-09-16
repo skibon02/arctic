@@ -7,6 +7,8 @@ use uuid::Uuid;
 
 /// PMD control point (read | write | indicate)
 pub(crate) const PMD_CP_UUID: Uuid = Uuid::from_u128(0xfb005c81_02e7_f387_1cad_8acd2d8df0c8);
+/// PMD data (notify). Must be subscribed before control point commands work.
+pub(crate) const PMD_DATA_UUID: Uuid = Uuid::from_u128(0xfb005c82_02e7_f387_1cad_8acd2d8df0c8);
 
 /// PS-FTP MTU characteristic (data transfer)
 pub(crate) const PSFTP_MTU_UUID: Uuid = Uuid::from_u128(0xfb005c51_02e7_f387_1cad_8acd2d8df0c8);
