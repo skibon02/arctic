@@ -203,6 +203,9 @@ impl PolarSensor {
     /// `secret` is an optional XOR encryption key. If provided, the same key
     /// must be supplied when downloading the recording.
     ///
+    /// When recording PPI, the device's PPI-mode LED is disabled first so it
+    /// does not blink during the measurement.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::NotConnected`] if not connected, or
@@ -212,6 +215,9 @@ impl PolarSensor {
         ty: MeasurementType,
         secret: Option<&[u8]>,
     ) -> PolarResult<()> {
+        if ty == MeasurementType::Ppi {
+            pftp::disable_ppi_led(self.device().await?).await?;
+        }
         control::start_offline_recording(self.device().await?, ty, secret).await
     }
 
@@ -279,6 +285,19 @@ impl PolarSensor {
     ) -> PolarResult<offline::PpiRecord> {
         let data = pftp::get_file(self.device().await?, &entry.path).await?;
         offline::parse_ppi_record(&data, secret)
+    }
+
+    /// Removes an offline recording from the device.
+    ///
+    /// The device never frees its memory automatically, so recordings must be
+    /// removed after they have been downloaded to avoid running out of space.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::PftpError`] if the removal fails.
+    pub async fn remove_offline_record(&self, entry: &OfflineRecord) -> PolarResult<()> {
+        pftp::remove_file(self.device().await?, &entry.path).await
     }
 
     async fn device(&self) -> PolarResult<&Peripheral> {

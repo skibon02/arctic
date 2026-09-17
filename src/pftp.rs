@@ -21,6 +21,19 @@ const STATUS_MORE: u8 = 0x03;
 /// Root directory holding offline recordings on the device
 const RECORDINGS_ROOT: &str = "/U/0/";
 
+/// Path of the LED configuration file on the device
+const LED_CONFIG_PATH: &str = "/LEDCFG.BIN";
+
+/// Writes the LED configuration to the device, disabling the PPI-mode LED.
+///
+/// The config file holds two bytes: the SDK-mode LED state and the PPI-mode LED
+/// state. The SDK-mode LED is left enabled while the PPI-mode LED is disabled
+/// so it does not blink during PPI measurements.
+pub(crate) async fn disable_ppi_led(device: &Peripheral) -> PolarResult<()> {
+    let contents = [0x01, 0x00];
+    put_file(device, LED_CONFIG_PATH, &contents).await
+}
+
 /// Lists offline recordings by walking the device's directory tree.
 ///
 /// The Verity Sense stores recordings under `/U/0/<date8>/R/<time6>/<TYPE><n>.REC`.
@@ -298,13 +311,206 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
     Ok(payload)
 }
 
+/// Removes a file or directory from the device over PS-FTP.
+///
+/// The request uses the same framing as `get_file` but with a REMOVE command
+/// and no payload. The device responds with an error code (0 on success).
+pub(crate) async fn remove_file(device: &Peripheral, path: &str) -> PolarResult<()> {
+    let mtu = find_characteristic(device, PSFTP_MTU_UUID).await?;
+    let d2h = find_characteristic(device, PSFTP_D2H_UUID).await?;
+
+    device.subscribe(&mtu).await.map_err(Error::BleError)?;
+    device.subscribe(&d2h).await.map_err(Error::BleError)?;
+
+    // Build the protobuf PbPFtpOperation { command = REMOVE (3), path = <path> }.
+    let operation = encode_pftp_operation_with_command(path, 3);
+    // Prefix with RFC60 2-byte little-endian length.
+    let mut message = Vec::with_capacity(2 + operation.len());
+    message.push((operation.len() & 0xff) as u8);
+    message.push(((operation.len() >> 8) & 0x7f) as u8);
+    message.extend_from_slice(&operation);
+
+    // Get the notification stream before writing so the response is not missed.
+    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
+
+    // Split the message into RFC76 frames and write them.
+    let mtu_size = mtu_size(device).await;
+    let mut seq = 0u8;
+    let mut offset = 0usize;
+    let mut next = 0u8;
+    loop {
+        let remaining = message.len() - offset;
+        let chunk_len = remaining.min(mtu_size - 1);
+        let last = remaining < mtu_size;
+
+        let mut frame = Vec::with_capacity(chunk_len + 1);
+        let status = if last { STATUS_LAST } else { STATUS_MORE };
+        frame.push((seq << 4) | (status << 1) | next);
+        frame.extend_from_slice(&message[offset..offset + chunk_len]);
+
+        device
+            .write(&mtu, &frame, WriteType::WithoutResponse)
+            .await
+            .map_err(Error::BleError)?;
+
+        offset += chunk_len;
+        seq = (seq + 1) & 0x0F;
+        next = 1;
+
+        if last {
+            break;
+        }
+    }
+
+    // Read the response frame and check for errors.
+    loop {
+        let data = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            notifications.next(),
+        )
+        .await
+        {
+            Ok(Some(d)) if d.uuid == PSFTP_MTU_UUID => d.value,
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err(Error::InvalidData),
+            Err(_) => return Err(Error::InvalidData),
+        };
+
+        if data.is_empty() {
+            return Err(Error::InvalidData);
+        }
+
+        let header = data[0];
+        let status = (header >> 1) & 0x03;
+
+        match status {
+            STATUS_ERROR_OR_RESPONSE => {
+                let code = if data.len() >= 3 {
+                    data[1] as u16 | ((data[2] as u16) << 8)
+                } else {
+                    0
+                };
+                if code == 0 {
+                    return Ok(());
+                }
+                return Err(Error::PftpError(code));
+            }
+            _ => return Err(Error::InvalidData),
+        }
+    }
+}
+
 /// Encodes a `PbPFtpOperation` protobuf message with a GET command.
 fn encode_pftp_operation(path: &str) -> Vec<u8> {
-    // field 1 (command) = varint 0x08, value 0 (GET);
+    encode_pftp_operation_with_command(path, 0)
+}
+
+/// Encodes a `PbPFtpOperation` protobuf message with the given command.
+///
+/// The command is a varint: GET = 0, PUT = 1, REMOVE = 3.
+fn encode_pftp_operation_with_command(path: &str, command: u8) -> Vec<u8> {
+    // field 1 (command) = varint 0x08, value <command>;
     // field 2 (path) = length-delimited 0x12, length, string bytes.
-    let mut out = vec![0x08, 0x00, 0x12, path.len() as u8];
+    let mut out = vec![0x08, command, 0x12, path.len() as u8];
     out.extend_from_slice(path.as_bytes());
     out
+}
+
+/// Uploads a file to the device over PS-FTP.
+///
+/// The operation header (a protobuf `PbPFtpOperation` with a PUT command) and
+/// the file contents are streamed as a single RFC76 message: header frames
+/// first (with the `next` bit clear on the first frame), then the data frames.
+pub(crate) async fn put_file(
+    device: &Peripheral,
+    path: &str,
+    contents: &[u8],
+) -> PolarResult<()> {
+    let mtu = find_characteristic(device, PSFTP_MTU_UUID).await?;
+    let d2h = find_characteristic(device, PSFTP_D2H_UUID).await?;
+
+    device.subscribe(&mtu).await.map_err(Error::BleError)?;
+    device.subscribe(&d2h).await.map_err(Error::BleError)?;
+
+    // Build the protobuf PbPFtpOperation { command = PUT (1), path = <path> }.
+    let operation = encode_pftp_operation_with_command(path, 1);
+    // Prefix with RFC60 2-byte little-endian length.
+    let mut message = Vec::with_capacity(2 + operation.len() + contents.len());
+    message.push((operation.len() & 0xff) as u8);
+    message.push(((operation.len() >> 8) & 0x7f) as u8);
+    message.extend_from_slice(&operation);
+    message.extend_from_slice(contents);
+
+    // Get the notification stream before writing so the response is not missed.
+    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
+
+    // Split the message into RFC76 frames and write them. The first frame has
+    // the `next` bit clear; subsequent frames set it. Host-to-device frames set
+    // the direction bit (status 0x06 for MORE, 0x02 for LAST).
+    let mtu_size = mtu_size(device).await;
+    let mut seq = 0u8;
+    let mut offset = 0usize;
+    let mut next = 0u8;
+    loop {
+        let remaining = message.len() - offset;
+        let chunk_len = remaining.min(mtu_size - 1);
+        let last = remaining < mtu_size;
+
+        let mut frame = Vec::with_capacity(chunk_len + 1);
+        let status = if last { 0x02 } else { 0x06 };
+        frame.push((seq << 4) | status | next);
+        frame.extend_from_slice(&message[offset..offset + chunk_len]);
+
+        device
+            .write(&mtu, &frame, WriteType::WithoutResponse)
+            .await
+            .map_err(Error::BleError)?;
+
+        offset += chunk_len;
+        seq = (seq + 1) & 0x0F;
+        next = 1;
+
+        if last {
+            break;
+        }
+    }
+
+    // Read the response frame and check for errors.
+    loop {
+        let data = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            notifications.next(),
+        )
+        .await
+        {
+            Ok(Some(d)) if d.uuid == PSFTP_MTU_UUID => d.value,
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err(Error::InvalidData),
+            Err(_) => return Err(Error::InvalidData),
+        };
+
+        if data.is_empty() {
+            return Err(Error::InvalidData);
+        }
+
+        let header = data[0];
+        let status = (header >> 1) & 0x03;
+
+        match status {
+            STATUS_ERROR_OR_RESPONSE => {
+                let code = if data.len() >= 3 {
+                    data[1] as u16 | ((data[2] as u16) << 8)
+                } else {
+                    0
+                };
+                if code == 0 {
+                    return Ok(());
+                }
+                return Err(Error::PftpError(code));
+            }
+            _ => return Err(Error::InvalidData),
+        }
+    }
 }
 
 /// Determines the ATT MTU size to use for framing.
