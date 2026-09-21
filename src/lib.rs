@@ -53,6 +53,29 @@ use uuid::Uuid;
 pub use offline::{OfflineRecord, PpiRecord, PpiSample};
 pub use polar_uuid::MeasurementType;
 
+/// Initializes the btleplug Android backend.
+///
+/// On Android, btleplug's `droidplug` backend must be initialized with a JNI
+/// environment before any Bluetooth operation. This binds the given `JavaVM`
+/// pointer into btleplug's global state and registers its native callbacks.
+///
+/// Must be called once, before constructing a [`PolarSensor`].
+///
+/// # Safety
+///
+/// `vm` must be a valid pointer to a `JavaVM` for the lifetime of the process.
+#[cfg(target_os = "android")]
+pub fn init_android(vm: *mut std::ffi::c_void) -> PolarResult<()> {
+    use jni::JavaVM;
+
+    let vm = unsafe { JavaVM::from_raw(vm as *mut jni::sys::JavaVM) }
+        .map_err(|_| Error::BleError(btleplug::Error::RuntimeError("invalid JavaVM pointer".into())))?;
+    let env = vm.attach_current_thread_permanently().map_err(|_| {
+        Error::BleError(btleplug::Error::RuntimeError("failed to attach JNI thread".into()))
+    })?;
+    btleplug::platform::init(&env).map_err(Error::BleError)
+}
+
 /// Error type for general errors and BLE errors from btleplug
 #[derive(Debug)]
 pub enum Error {
