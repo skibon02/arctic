@@ -10,6 +10,10 @@ pub(crate) const PMD_CP_UUID: Uuid = Uuid::from_u128(0xfb005c81_02e7_f387_1cad_8
 /// PMD data (notify). Must be subscribed before control point commands work.
 pub(crate) const PMD_DATA_UUID: Uuid = Uuid::from_u128(0xfb005c82_02e7_f387_1cad_8acd2d8df0c8);
 
+/// Standard BLE Heart Rate Measurement characteristic (notify).
+pub(crate) const HEART_RATE_MEASUREMENT_UUID: Uuid =
+    Uuid::from_u128(0x00002a37_0000_1000_8000_00805f9b34fb);
+
 /// PS-FTP MTU characteristic (data transfer)
 pub(crate) const PSFTP_MTU_UUID: Uuid = Uuid::from_u128(0xfb005c51_02e7_f387_1cad_8acd2d8df0c8);
 /// PS-FTP device-to-host notification characteristic

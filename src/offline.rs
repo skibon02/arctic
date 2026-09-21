@@ -205,6 +205,25 @@ fn parse_ppi_frame(frame: &[u8]) -> PolarResult<Vec<PpiSample>> {
     Ok(samples)
 }
 
+/// Parses a PMD data frame (10-byte header followed by raw PPI samples) into
+/// PPI samples. The header is `[type(1)][timestamp(8)][frame_type(1)]`.
+///
+/// Returns the frame timestamp (microseconds) alongside the samples. The
+/// timestamp is the time of the *last* sample in the frame; earlier samples are
+/// spaced backward by their own PP intervals.
+pub(crate) fn parse_ppi_stream_frame(frame: &[u8]) -> PolarResult<(u64, Vec<PpiSample>)> {
+    if frame.len() <= PMD_FRAME_HEADER_LENGTH {
+        return Ok((0, Vec::new()));
+    }
+    let timestamp = u64::from_le_bytes(
+        frame[1..9]
+            .try_into()
+            .map_err(|_| Error::InvalidRecording)?,
+    );
+    let samples = parse_ppi_frame(&frame[PMD_FRAME_HEADER_LENGTH..])?;
+    Ok((timestamp, samples))
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

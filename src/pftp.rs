@@ -30,7 +30,23 @@ const LED_CONFIG_PATH: &str = "/LEDCFG.BIN";
 /// state. The SDK-mode LED is left enabled while the PPI-mode LED is disabled
 /// so it does not blink during PPI measurements.
 pub(crate) async fn disable_ppi_led(device: &Peripheral) -> PolarResult<()> {
-    let contents = [0x01, 0x00];
+    set_led(device, true, false).await
+}
+
+/// Writes the LED configuration to the device.
+///
+/// The config file holds two bytes: the SDK-mode LED state and the PPI-mode LED
+/// state (`0x01` = enabled, `0x00` = disabled). This is a persistent setting on
+/// the device.
+pub(crate) async fn set_led(
+    device: &Peripheral,
+    sdk_mode_led: bool,
+    ppi_mode_led: bool,
+) -> PolarResult<()> {
+    let contents = [
+        if sdk_mode_led { 0x01 } else { 0x00 },
+        if ppi_mode_led { 0x01 } else { 0x00 },
+    ];
     put_file(device, LED_CONFIG_PATH, &contents).await
 }
 

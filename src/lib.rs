@@ -45,7 +45,7 @@ mod polar_uuid;
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral};
-use futures::stream::StreamExt;
+use futures::stream::{BoxStream, StreamExt};
 use std::fmt;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
@@ -298,6 +298,147 @@ impl PolarSensor {
     /// [`Error::PftpError`] if the removal fails.
     pub async fn remove_offline_record(&self, entry: &OfflineRecord) -> PolarResult<()> {
         pftp::remove_file(self.device().await?, &entry.path).await
+    }
+
+    /// Sets the device LED configuration.
+    ///
+    /// This is a persistent setting on the device. `sdk_mode_led` controls the
+    /// LED while the device is in SDK mode, and `ppi_mode_led` controls the LED
+    /// that blinks during PPI measurements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::PftpError`] if the write fails.
+    pub async fn set_led(&self, sdk_mode_led: bool, ppi_mode_led: bool) -> PolarResult<()> {
+        pftp::set_led(self.device().await?, sdk_mode_led, ppi_mode_led).await
+    }
+
+    /// Starts online PPI streaming and returns a stream of parsed PPI frames.
+    ///
+    /// Unlike offline recording, online streaming delivers PPI samples live over
+    /// the PMD data characteristic while the connection is open. Each yielded
+    /// item is a `(timestamp_us, samples)` pair: the frame timestamp (time of
+    /// the last sample, in microseconds) and the parsed samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::ControlPointError`] if the device rejects the start request.
+    pub async fn start_ppi_streaming(
+        &self,
+    ) -> PolarResult<BoxStream<'static, (u64, Vec<PpiSample>)>> {
+        let device = self.device().await?;
+
+        // Subscribe to the PMD data characteristic so frames are delivered.
+        let data_char = find_characteristic(device, polar_uuid::PMD_DATA_UUID).await?;
+        device.subscribe(&data_char).await.map_err(Error::BleError)?;
+
+        // Start online PPI streaming.
+        control::start_online_streaming(device, MeasurementType::Ppi).await?;
+
+        let notifications = device.notifications().await.map_err(Error::BleError)?;
+        let stream = notifications.filter_map(move |n| {
+            if n.uuid != polar_uuid::PMD_DATA_UUID {
+                return futures::future::ready(None);
+            }
+            let (ts, samples) = match offline::parse_ppi_stream_frame(&n.value) {
+                Ok((ts, s)) if !s.is_empty() => (ts, s),
+                _ => return futures::future::ready(None),
+            };
+            futures::future::ready(Some((ts, samples)))
+        });
+
+        Ok(stream.boxed())
+    }
+
+    /// Stops online PPI streaming.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::ControlPointError`] if the device rejects the stop request.
+    pub async fn stop_ppi_streaming(&self) -> PolarResult<()> {
+        control::stop_measurement(self.device().await?, MeasurementType::Ppi).await
+    }
+
+    /// Starts standard BLE Heart Rate streaming and returns a stream of BPM
+    /// values.
+    ///
+    /// Unlike PPI streaming, this uses the standard Heart Rate Service
+    /// (`0x180D`) measurement characteristic (`0x2A37`), which delivers only the
+    /// current heart rate in beats per minute with no pulse-to-pulse intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::BleError`] if the subscription fails.
+    pub async fn start_hr_streaming(&self) -> PolarResult<BoxStream<'static, u8>> {
+        let device = self.device().await?;
+
+        let hr_char = find_characteristic(device, polar_uuid::HEART_RATE_MEASUREMENT_UUID).await?;
+        device.subscribe(&hr_char).await.map_err(Error::BleError)?;
+
+        let notifications = device.notifications().await.map_err(Error::BleError)?;
+        let stream = notifications.filter_map(move |n| {
+            if n.uuid != polar_uuid::HEART_RATE_MEASUREMENT_UUID {
+                return futures::future::ready(None);
+            }
+            // Heart Rate Measurement: [flags, bpm, ...]. BPM is the second byte.
+            let bpm = n.value.get(1).copied();
+            futures::future::ready(bpm)
+        });
+
+        Ok(stream.boxed())
+    }
+
+    /// Stops standard BLE Heart Rate streaming by unsubscribing from the
+    /// measurement characteristic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::BleError`] if the unsubscribe fails.
+    pub async fn stop_hr_streaming(&self) -> PolarResult<()> {
+        let device = self.device().await?;
+        let hr_char = find_characteristic(device, polar_uuid::HEART_RATE_MEASUREMENT_UUID).await?;
+        device
+            .unsubscribe(&hr_char)
+            .await
+            .map_err(Error::BleError)
+    }
+
+    /// Scans for and returns all matching Polar devices (name and device id).
+    ///
+    /// The device id is the trailing 8-character suffix of the advertised name.
+    /// The scan runs for a short period so that nearby devices can be discovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BleError`] if the adapter or scan fails, or
+    /// [`Error::NoBleAdaptor`] if no adapters are available.
+    pub async fn list_devices(&self) -> PolarResult<Vec<(String, String)>> {
+        let central = self.scan().await?;
+
+        // Give the adapter a moment to discover nearby devices.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let mut devices = Vec::new();
+        for p in central.peripherals().await.map_err(Error::BleError)? {
+            if let Some(props) = p.properties().await.map_err(Error::BleError)? {
+                if let Some(name) = props.local_name {
+                    if name.starts_with("Polar") {
+                        if let Some(id) = name.split_whitespace().last() {
+                            if id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                                devices.push((name.clone(), id.to_uppercase()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(devices)
     }
 
     async fn device(&self) -> PolarResult<&Peripheral> {

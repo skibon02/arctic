@@ -58,6 +58,25 @@ pub(crate) async fn stop_measurement(device: &Peripheral, ty: MeasurementType) -
     Ok(())
 }
 
+/// Starts online (streaming) measurement of the given type.
+///
+/// Unlike offline recording, online streaming sends data continuously over the
+/// PMD data characteristic while the connection is open. The device uses its
+/// default settings when none are supplied.
+///
+/// If the device reports "already in state" (error 6), streaming is already
+/// active and the request is treated as a no-op success.
+pub(crate) async fn start_online_streaming(
+    device: &Peripheral,
+    ty: MeasurementType,
+) -> PolarResult<()> {
+    let response = send_command(device, vec![REQUEST_MEASUREMENT_START, ty.as_u8()]).await?;
+    match response.error_code {
+        0 | 6 => Ok(()),
+        code => Err(Error::ControlPointError(code)),
+    }
+}
+
 /// Queries the device for the currently active measurements.
 ///
 /// Returns the raw parameter bytes of the response, each encoding a measurement
