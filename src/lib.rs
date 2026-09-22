@@ -80,7 +80,7 @@ pub fn init_android(vm: *mut std::ffi::c_void, activity: *mut std::ffi::c_void) 
     // classes (bundled in classes.dex) despite FindClass using the system loader
     // on a NativeActivity.
     let class_loader = {
-        let activity = unsafe { jni::objects::JObject::from(activity as jni::sys::jobject) };
+        let activity = jni::objects::JObject::from(activity as jni::sys::jobject);
         // Context.getClassLoader() returns the app class loader, which sees the
         // classes.dex bundled in the APK. (activity.getClass().getClassLoader()
         // would return the boot loader since NativeActivity is a system class.)
