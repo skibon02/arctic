@@ -130,9 +130,20 @@ async fn send_command(device: &Peripheral, command: Vec<u8>) -> PolarResult<Cont
         .await
         {
             Ok(Some(d)) => d,
-            Ok(None) => return Err(Error::InvalidData),
-            Err(_) => return Err(Error::InvalidData),
+            Ok(None) => {
+                log::error!("arctic: send_command: notification stream ended");
+                return Err(Error::InvalidData);
+            }
+            Err(_) => {
+                log::error!("arctic: send_command: timed out waiting for control point response");
+                return Err(Error::InvalidData);
+            }
         };
+        log::info!(
+            "arctic: send_command: notification uuid={} value={:02x?}",
+            data.uuid,
+            data.value
+        );
         if data.uuid == PMD_CP_UUID && data.value.first() == Some(&CP_RESPONSE) {
             return ControlResponse::new(&data.value);
         }

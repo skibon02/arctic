@@ -18,6 +18,7 @@ path = "src/lib.rs"
 [dependencies]
 btleplug = { path = "../btleplug" }
 futures = "0.3"
+log = "0.4"
 tokio = { version = "1.10.0", features = ["macros", "rt", "rt-multi-thread", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 uuid = "1"

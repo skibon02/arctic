@@ -201,8 +201,11 @@ impl PolarSensor {
             .await;
 
         if let Some(device) = &self.ble_device {
+            log::info!("arctic: connecting to device...");
             device.connect().await.map_err(Error::BleError)?;
+            log::info!("arctic: connected, discovering services...");
             device.discover_services().await.map_err(Error::BleError)?;
+            log::info!("arctic: services discovered");
             return Ok(());
         }
 

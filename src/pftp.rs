@@ -240,6 +240,9 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
     message.push((operation.len() & 0xff) as u8);
     message.push(((operation.len() >> 8) & 0x7f) as u8);
     message.extend_from_slice(&operation);
+    log::info!(
+        "arctic: get_file({path:?}) operation={operation:02x?} message={message:02x?}"
+    );
 
     // Get the notification stream before writing so the response is not missed.
     let mut notifications = device.notifications().await.map_err(Error::BleError)?;
@@ -298,6 +301,10 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
 
         let header = data[0];
         let status = (header >> 1) & 0x03;
+        log::info!(
+            "arctic: get_file({path:?}) frame header={header:02x} status={status} len={}",
+            data.len()
+        );
 
         match status {
             STATUS_ERROR_OR_RESPONSE => {
@@ -324,6 +331,7 @@ pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec
         }
     }
 
+    log::info!("arctic: get_file({path:?}) got {} bytes", payload.len());
     Ok(payload)
 }
 
@@ -531,9 +539,12 @@ pub(crate) async fn put_file(
 
 /// Determines the ATT MTU size to use for framing.
 async fn mtu_size(_device: &Peripheral) -> usize {
-    // btleplug does not expose the negotiated MTU directly; use a conservative
-    // value that works across platforms.
-    23
+    // The Polar SDK uses an MTU of 20 (the default ATT MTU of 23 minus the 3-byte
+    // ATT header), leaving 19 payload bytes per RFC76 frame. Requests larger than
+    // 19 bytes must be split across multiple frames; using a larger value here
+    // produces a single oversized frame that the device rejects with
+    // `unidentifiedHostError` (100).
+    20
 }
 
 #[cfg(test)]
