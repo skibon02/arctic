@@ -1,16 +1,17 @@
 //! # Arctic
 //!
-//! A Rust library for offline PPI (pulse-to-pulse interval) recording with the
-//! Polar Verity Sense optical heart rate sensor.
+//! A Rust library for the Polar Verity Sense optical heart rate sensor.
 //!
-//! The Verity Sense can record PPI data to its internal memory while
-//! disconnected from Bluetooth. This library starts and stops that recording,
-//! lists the recorded files, and downloads and parses them.
+//! The Verity Sense can record data to its internal memory while disconnected
+//! from Bluetooth, and can stream data live over Bluetooth. This library starts
+//! and stops offline recording, lists and downloads recordings, and streams
+//! online measurement data.
 //!
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use arctic::{PolarSensor, MeasurementType};
+//! use arctic::{PolarSensor, MeasurementType, StreamFrame};
+//! use futures::stream::StreamExt;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,18 +19,20 @@
 //!     let mut sensor = PolarSensor::new("7B45F72B".to_string()).await?;
 //!     sensor.connect().await?;
 //!
-//!     // Start recording PPI to the device's internal memory.
-//!     sensor.start_offline_recording(MeasurementType::Ppi, None).await?;
+//!     // Discover the available stream settings, then select one of each.
+//!     let mut settings = sensor.request_stream_settings(MeasurementType::Acc).await?;
+//!     println!("sampling rates: {:?}", settings.sample_rates());
+//!     settings.set_sample_rate(52).set_range(8).set_resolution(16);
 //!
-//!     // The device records while disconnected. Reconnect later to stop and
-//!     // download the recorded data.
-//!     sensor.stop_offline_recording(MeasurementType::Ppi).await?;
-//!
-//!     let recordings = sensor.list_offline_recordings().await?;
-//!     for entry in recordings {
-//!         let ppi = sensor.get_offline_record(&entry, None).await?;
-//!         for sample in ppi.samples {
-//!             println!("pp={} ms, hr={}", sample.pp_in_ms, sample.hr);
+//!     let mut stream = sensor.start_streaming(MeasurementType::Acc, settings).await?;
+//!     while let Some(frame) = stream.next().await {
+//!         match frame? {
+//!             StreamFrame::Acc(samples) => {
+//!                 for sample in samples {
+//!                     println!("x={} y={} z={}", sample.x, sample.y, sample.z);
+//!                 }
+//!             }
+//!             _ => {}
 //!         }
 //!     }
 //!     Ok(())
@@ -38,10 +41,14 @@
 
 #![deny(missing_docs)]
 
+mod connection;
 mod control;
 mod offline;
 mod pftp;
+mod pmd;
 mod polar_uuid;
+mod settings;
+mod stream;
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral};
@@ -50,8 +57,11 @@ use std::fmt;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
-pub use offline::{OfflineRecord, PpiRecord, PpiSample};
+pub use offline::{OfflineRecord, PpiRecord};
+pub use pmd::{AccSample, GyroSample, MagCalibration, MagSample, PpiSample};
 pub use polar_uuid::MeasurementType;
+pub use settings::StreamSettings;
+pub use stream::StreamFrame;
 
 /// Initializes the btleplug Android backend.
 ///
@@ -83,6 +93,10 @@ pub enum Error {
     NoDevice,
     /// Device is not connected, but function was called that requires it
     NotConnected,
+    /// The device disconnected during an operation
+    Disconnected,
+    /// The device stopped the measurement on its own
+    StreamStopped,
     /// Device is missing a characteristic that was used
     CharacteristicNotFound,
     /// Data packets received from device could not be parsed
@@ -105,6 +119,8 @@ impl fmt::Display for Error {
             Error::NoBleAdaptor => "No BLE adaptor".to_string(),
             Error::NoDevice => "No device".to_string(),
             Error::NotConnected => "Not connected".to_string(),
+            Error::Disconnected => "Device disconnected".to_string(),
+            Error::StreamStopped => "Device stopped the stream".to_string(),
             Error::CharacteristicNotFound => "Characteristic not found".to_string(),
             Error::InvalidData => "Invalid data".to_string(),
             Error::InvalidLength => "Invalid length".to_string(),
@@ -129,8 +145,8 @@ pub struct PolarSensor {
     device_id: String,
     /// BLE connection handlers
     ble_manager: Manager,
-    /// The connection to the device
-    ble_device: Option<Peripheral>,
+    /// The active connection, if any
+    connection: Option<connection::Connection>,
 }
 
 impl PolarSensor {
@@ -151,7 +167,7 @@ impl PolarSensor {
         Ok(PolarSensor {
             device_id,
             ble_manager,
-            ble_device: None,
+            connection: None,
         })
     }
 
@@ -164,22 +180,35 @@ impl PolarSensor {
     /// discovery fails. Returns [`Error::NoBleAdaptor`] if no adapters are
     /// available, and [`Error::NoDevice`] if no Verity Sense was found.
     pub async fn discover(&mut self) -> PolarResult<()> {
+        self.discover_with_timeout(Duration::from_secs(10)).await
+    }
+
+    /// Scans for the first Polar Verity Sense for at most `timeout` and
+    /// connects to it, regardless of the device id this instance was created
+    /// with.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Error::BleError`] if the bluetooth adapter, scan, or service
+    /// discovery fails. Returns [`Error::NoBleAdaptor`] if no adapters are
+    /// available, and [`Error::NoDevice`] if no Verity Sense was found within
+    /// `timeout`.
+    pub async fn discover_with_timeout(&mut self, timeout: Duration) -> PolarResult<()> {
         let central = self.scan().await?;
 
-        self.ble_device = self
-            .find_device_by(&central, |name| name.starts_with("Polar Sense"))
-            .await;
+        let device = self
+            .find_device_by(&central, |name| name.starts_with("Polar Sense"), timeout)
+            .await
+            .ok_or(Error::NoDevice)?;
 
-        if let Some(device) = &self.ble_device {
-            log::info!("arctic: connecting to device...");
-            device.connect().await.map_err(Error::BleError)?;
-            log::info!("arctic: connected, discovering services...");
-            device.discover_services().await.map_err(Error::BleError)?;
-            log::info!("arctic: services discovered");
-            return Ok(());
-        }
+        // Stop scanning before connecting; an active scan interferes with the
+        // connection on some platforms.
+        let _ = central.stop_scan().await;
 
-        Err(Error::NoDevice)
+        log::info!("arctic: connecting to device...");
+        self.connection = Some(connection::Connection::connect(&central, device).await?);
+        log::info!("arctic: connected");
+        Ok(())
     }
 
     /// Finds and connects to the device id associated with this instance.
@@ -193,30 +222,38 @@ impl PolarSensor {
         let central = self.scan().await?;
         let device_id = self.device_id.clone();
 
-        self.ble_device = self
-            .find_device_by(&central, move |name| {
-                name.starts_with("Polar") && name.ends_with(&device_id)
-            })
-            .await;
+        let device = self
+            .find_device_by(
+                &central,
+                move |name| name.starts_with("Polar") && name.ends_with(&device_id),
+                Duration::from_secs(10),
+            )
+            .await
+            .ok_or(Error::NoDevice)?;
 
-        if let Some(device) = &self.ble_device {
-            device.connect().await.map_err(Error::BleError)?;
-            device.discover_services().await.map_err(Error::BleError)?;
-            return Ok(());
+        // Stop scanning before connecting; an active scan interferes with the
+        // connection on some platforms.
+        let _ = central.stop_scan().await;
+
+        self.connection = Some(connection::Connection::connect(&central, device).await?);
+        Ok(())
+    }
+
+    /// Disconnects from the device.
+    ///
+    /// Any active stream ends with [`Error::Disconnected`].
+    pub async fn disconnect(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.disconnect().await;
         }
-
-        Err(Error::NoDevice)
     }
 
     /// Returns whether the device is currently connected or not
     pub async fn is_connected(&self) -> bool {
-        if let Some(device) = &self.ble_device {
-            if let Ok(value) = device.is_connected().await {
-                return value;
-            }
+        match &self.connection {
+            Some(connection) => connection.is_connected().await,
+            None => false,
         }
-
-        false
     }
 
     /// Starts offline recording of the given measurement type to the device's
@@ -239,10 +276,11 @@ impl PolarSensor {
         ty: MeasurementType,
         secret: Option<&[u8]>,
     ) -> PolarResult<()> {
+        let conn = self.connection()?;
         if ty == MeasurementType::Ppi {
-            pftp::disable_ppi_led(self.device().await?).await?;
+            pftp::disable_ppi_led(conn).await?;
         }
-        control::start_offline_recording(self.device().await?, ty, secret).await
+        control::start_offline_recording(conn, ty, secret).await
     }
 
     /// Stops the offline recording of the given measurement type.
@@ -252,7 +290,7 @@ impl PolarSensor {
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::ControlPointError`] if the device rejects the request.
     pub async fn stop_offline_recording(&self, ty: MeasurementType) -> PolarResult<()> {
-        control::stop_measurement(self.device().await?, ty).await
+        control::stop_measurement(self.connection()?, ty).await
     }
 
     /// Queries the device for the currently active measurements.
@@ -265,7 +303,7 @@ impl PolarSensor {
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::ControlPointError`] if the device rejects the request.
     pub async fn get_measurement_status(&self) -> PolarResult<Vec<u8>> {
-        control::get_measurement_status(self.device().await?).await
+        control::get_measurement_status(self.connection()?).await
     }
 
     /// Returns whether an offline recording of the given type is currently
@@ -279,7 +317,7 @@ impl PolarSensor {
         &self,
         ty: MeasurementType,
     ) -> PolarResult<bool> {
-        control::is_offline_recording_active(self.device().await?, ty).await
+        control::is_offline_recording_active(self.connection()?, ty).await
     }
 
     /// Lists the offline recordings stored on the device.
@@ -289,7 +327,7 @@ impl PolarSensor {
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::PftpError`] if the file listing fails.
     pub async fn list_offline_recordings(&self) -> PolarResult<Vec<OfflineRecord>> {
-        pftp::list_offline_recordings(self.device().await?).await
+        pftp::list_offline_recordings(self.connection()?).await
     }
 
     /// Downloads and parses an offline recording.
@@ -306,8 +344,8 @@ impl PolarSensor {
         &self,
         entry: &OfflineRecord,
         secret: Option<&[u8]>,
-    ) -> PolarResult<offline::PpiRecord> {
-        let data = pftp::get_file(self.device().await?, &entry.path).await?;
+    ) -> PolarResult<PpiRecord> {
+        let data = pftp::get_file(self.connection()?, &entry.path).await?;
         offline::parse_ppi_record(&data, secret)
     }
 
@@ -321,7 +359,7 @@ impl PolarSensor {
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::PftpError`] if the removal fails.
     pub async fn remove_offline_record(&self, entry: &OfflineRecord) -> PolarResult<()> {
-        pftp::remove_file(self.device().await?, &entry.path).await
+        pftp::remove_file(self.connection()?, &entry.path).await
     }
 
     /// Sets the device LED configuration.
@@ -335,61 +373,63 @@ impl PolarSensor {
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::PftpError`] if the write fails.
     pub async fn set_led(&self, sdk_mode_led: bool, ppi_mode_led: bool) -> PolarResult<()> {
-        pftp::set_led(self.device().await?, sdk_mode_led, ppi_mode_led).await
+        pftp::set_led(self.connection()?, sdk_mode_led, ppi_mode_led).await
     }
 
-    /// Starts online PPI streaming and returns a stream of parsed PPI frames.
+    /// Requests the stream settings available for a measurement type.
     ///
-    /// Unlike offline recording, online streaming delivers PPI samples live over
-    /// the PMD data characteristic while the connection is open. Each yielded
-    /// item is a `(timestamp_us, samples)` pair: the frame timestamp (time of
-    /// the last sample, in microseconds) and the parsed samples.
+    /// The returned [`StreamSettings`] lists every sampling rate, resolution,
+    /// range, and channel count the device offers for the type. Select one of
+    /// each with the `set_*` methods before starting a stream. Settings that
+    /// are not selected use the device defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected, or
+    /// [`Error::ControlPointError`] if the device rejects the request.
+    pub async fn request_stream_settings(
+        &self,
+        ty: MeasurementType,
+    ) -> PolarResult<StreamSettings> {
+        control::request_stream_settings(self.connection()?, ty).await
+    }
+
+    /// Starts online streaming of the given measurement type.
+    ///
+    /// The returned stream yields batches of parsed samples. It ends, with an
+    /// error, when the device disconnects, when the device stops the
+    /// measurement, or when a frame cannot be parsed. Dropping the stream stops
+    /// the measurement on the device.
+    ///
+    /// The Verity Sense supports only one stream at a time for most types. Use
+    /// [`PolarSensor::stop_streaming`] to stop a stream explicitly.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::ControlPointError`] if the device rejects the start request.
-    pub async fn start_ppi_streaming(
+    pub async fn start_streaming(
         &self,
-    ) -> PolarResult<BoxStream<'static, (u64, Vec<PpiSample>)>> {
-        let device = self.device().await?;
-
-        // Subscribe to the PMD data characteristic so frames are delivered.
-        let data_char = find_characteristic(device, polar_uuid::PMD_DATA_UUID).await?;
-        device.subscribe(&data_char).await.map_err(Error::BleError)?;
-
-        // Start online PPI streaming.
-        control::start_online_streaming(device, MeasurementType::Ppi).await?;
-
-        let notifications = device.notifications().await.map_err(Error::BleError)?;
-        let stream = notifications.filter_map(move |n| {
-            if n.uuid != polar_uuid::PMD_DATA_UUID {
-                return futures::future::ready(None);
-            }
-            let (ts, samples) = match offline::parse_ppi_stream_frame(&n.value) {
-                Ok((ts, s)) if !s.is_empty() => (ts, s),
-                _ => return futures::future::ready(None),
-            };
-            futures::future::ready(Some((ts, samples)))
-        });
-
-        Ok(stream.boxed())
+        ty: MeasurementType,
+        settings: StreamSettings,
+    ) -> PolarResult<BoxStream<'static, PolarResult<StreamFrame>>> {
+        stream::start(self.connection()?, ty, settings).await
     }
 
-    /// Stops online PPI streaming.
+    /// Stops online streaming of the given measurement type.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::ControlPointError`] if the device rejects the stop request.
-    pub async fn stop_ppi_streaming(&self) -> PolarResult<()> {
-        control::stop_measurement(self.device().await?, MeasurementType::Ppi).await
+    pub async fn stop_streaming(&self, ty: MeasurementType) -> PolarResult<()> {
+        control::stop_measurement(self.connection()?, ty).await
     }
 
     /// Starts standard BLE Heart Rate streaming and returns a stream of BPM
     /// values.
     ///
-    /// Unlike PPI streaming, this uses the standard Heart Rate Service
+    /// Unlike PMD streaming, this uses the standard Heart Rate Service
     /// (`0x180D`) measurement characteristic (`0x2A37`), which delivers only the
     /// current heart rate in beats per minute with no pulse-to-pulse intervals.
     ///
@@ -398,20 +438,19 @@ impl PolarSensor {
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::BleError`] if the subscription fails.
     pub async fn start_hr_streaming(&self) -> PolarResult<BoxStream<'static, u8>> {
-        let device = self.device().await?;
+        let conn = self.connection()?;
+        let mut rx = conn
+            .subscribe(polar_uuid::HEART_RATE_MEASUREMENT_UUID)
+            .await?;
 
-        let hr_char = find_characteristic(device, polar_uuid::HEART_RATE_MEASUREMENT_UUID).await?;
-        device.subscribe(&hr_char).await.map_err(Error::BleError)?;
-
-        let notifications = device.notifications().await.map_err(Error::BleError)?;
-        let stream = notifications.filter_map(move |n| {
-            if n.uuid != polar_uuid::HEART_RATE_MEASUREMENT_UUID {
-                return futures::future::ready(None);
+        let stream = async_stream::stream! {
+            while let Some(value) = rx.recv().await {
+                // Heart Rate Measurement: [flags, bpm, ...]. BPM is the second byte.
+                if let Some(bpm) = value.get(1).copied() {
+                    yield bpm;
+                }
             }
-            // Heart Rate Measurement: [flags, bpm, ...]. BPM is the second byte.
-            let bpm = n.value.get(1).copied();
-            futures::future::ready(bpm)
-        });
+        };
 
         Ok(stream.boxed())
     }
@@ -424,12 +463,9 @@ impl PolarSensor {
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::BleError`] if the unsubscribe fails.
     pub async fn stop_hr_streaming(&self) -> PolarResult<()> {
-        let device = self.device().await?;
-        let hr_char = find_characteristic(device, polar_uuid::HEART_RATE_MEASUREMENT_UUID).await?;
-        device
-            .unsubscribe(&hr_char)
+        self.connection()?
+            .unsubscribe(polar_uuid::HEART_RATE_MEASUREMENT_UUID)
             .await
-            .map_err(Error::BleError)
     }
 
     /// Scans for and returns all matching Polar devices (name and device id).
@@ -465,12 +501,9 @@ impl PolarSensor {
         Ok(devices)
     }
 
-    async fn device(&self) -> PolarResult<&Peripheral> {
-        if let Some(device) = &self.ble_device {
-            return Ok(device);
-        }
-
-        Err(Error::NoDevice)
+    /// Returns the active connection, or [`Error::NotConnected`].
+    fn connection(&self) -> PolarResult<&connection::Connection> {
+        self.connection.as_ref().ok_or(Error::NotConnected)
     }
 
     /// Starts a scan on the first available adapter.
@@ -492,12 +525,17 @@ impl PolarSensor {
     /// Scans for a device whose advertised local name matches `predicate`,
     /// reacting to discovery events until a match is found or the scan times
     /// out.
-    async fn find_device_by<F>(&self, central: &Adapter, predicate: F) -> Option<Peripheral>
+    async fn find_device_by<F>(
+        &self,
+        central: &Adapter,
+        predicate: F,
+        timeout: Duration,
+    ) -> Option<Peripheral>
     where
         F: Fn(&str) -> bool,
     {
         let mut events = central.events().await.ok()?;
-        let deadline = time::Instant::now() + Duration::from_secs(10);
+        let deadline = time::Instant::now() + timeout;
 
         // Check peripherals already discovered before subscribing to events.
         if let Some(device) = matching_peripheral(central, &predicate).await {

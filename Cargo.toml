@@ -16,6 +16,7 @@ name = "arctic"
 path = "src/lib.rs"
 
 [dependencies]
+async-stream = "0.3"
 btleplug = { version = "0.13.3" }
 futures = "0.3"
 log = "0.4"

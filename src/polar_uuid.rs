@@ -19,8 +19,8 @@ pub(crate) const PSFTP_MTU_UUID: Uuid = Uuid::from_u128(0xfb005c51_02e7_f387_1ca
 /// PS-FTP device-to-host notification characteristic
 pub(crate) const PSFTP_D2H_UUID: Uuid = Uuid::from_u128(0xfb005c52_02e7_f387_1cad_8acd2d8df0c8);
 
-/// The measurement types supported by the Verity Sense for offline recording.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+/// The measurement types supported by the Verity Sense.
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum MeasurementType {
     /// Photoplethysmography (optical heart rate signal)
     Ppg,
@@ -43,6 +43,18 @@ impl MeasurementType {
             MeasurementType::Acc => 0x02,
             MeasurementType::Gyro => 0x05,
             MeasurementType::Mag => 0x06,
+        }
+    }
+
+    /// Maps a raw PMD measurement type byte to a measurement type.
+    pub(crate) fn from_id(id: u8) -> Option<Self> {
+        match id {
+            0x01 => Some(MeasurementType::Ppg),
+            0x02 => Some(MeasurementType::Acc),
+            0x03 => Some(MeasurementType::Ppi),
+            0x05 => Some(MeasurementType::Gyro),
+            0x06 => Some(MeasurementType::Mag),
+            _ => None,
         }
     }
 

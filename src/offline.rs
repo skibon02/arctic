@@ -1,7 +1,12 @@
 //! # Offline
 //!
 //! Parsing of offline recording files downloaded from the device.
+//!
+//! An offline recording file starts with a security strategy byte, followed by
+//! an (optionally encrypted) metadata block and a payload of PMD data frames.
+//! Only PPI recordings are parsed here.
 
+use crate::pmd::{self, PpiSample};
 use crate::polar_uuid::MeasurementType;
 use crate::{Error, PolarResult};
 
@@ -11,8 +16,6 @@ const OFFLINE_HEADER_MAGIC: u32 = 0x3D7C_4C2B;
 const OFFLINE_HEADER_LENGTH: usize = 16;
 /// Length of the start time field in bytes
 const DATE_TIME_LENGTH: usize = 20;
-/// Size of a single PPI sample in bytes
-const PPI_SAMPLE_CHUNK: usize = 6;
 /// Size of the PMD data frame header prepended to each frame's samples
 const PMD_FRAME_HEADER_LENGTH: usize = 10;
 
@@ -41,23 +44,6 @@ pub struct OfflineRecord {
     pub size: u64,
     /// The measurement type of the recording
     pub ty: MeasurementType,
-}
-
-/// A single pulse-to-pulse interval sample.
-#[derive(Debug, Clone)]
-pub struct PpiSample {
-    /// Heart rate in beats per minute
-    pub hr: u8,
-    /// Pulse-to-pulse interval in milliseconds
-    pub pp_in_ms: u16,
-    /// Error estimate of the PP interval in milliseconds
-    pub pp_error_estimate: u16,
-    /// Whether movement was detected during acquisition
-    pub blocker: bool,
-    /// Whether skin contact was present
-    pub skin_contact: bool,
-    /// Whether the skin contact flag is supported by the device
-    pub skin_contact_supported: bool,
 }
 
 /// A parsed offline recording of PPI data.
@@ -158,70 +144,21 @@ pub(crate) fn parse_ppi_record(data: &[u8], secret: Option<&[u8]>) -> PolarResul
         let frame_end = (pos + frame_size).min(payload.len());
         let frame = &payload[pos..frame_end];
         if frame.len() > PMD_FRAME_HEADER_LENGTH {
-            samples.extend(parse_ppi_frame(&frame[PMD_FRAME_HEADER_LENGTH..])?);
+            let timestamp = u64::from_le_bytes(frame[1..9].try_into().unwrap());
+            samples.extend(pmd::parse_ppi(&frame[PMD_FRAME_HEADER_LENGTH..], timestamp)?);
         }
         pos = frame_end;
 
         // Read the next frame's length if present.
         if pos + 2 <= payload.len() {
-            frame_size =
-                u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+            frame_size = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
         } else {
             break;
         }
     }
 
-    Ok(PpiRecord {
-        start_time,
-        samples,
-    })
-}
-
-/// Parses a single PPI data frame into samples.
-fn parse_ppi_frame(frame: &[u8]) -> PolarResult<Vec<PpiSample>> {
-    if !frame.len().is_multiple_of(PPI_SAMPLE_CHUNK) {
-        return Err(Error::InvalidRecording);
-    }
-
-    let (chunks, _) = frame.as_chunks::<PPI_SAMPLE_CHUNK>();
-    let mut samples = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let hr = chunk[0];
-        let pp_in_ms = u16::from_le_bytes([chunk[1], chunk[2]]);
-        let pp_error_estimate = u16::from_le_bytes([chunk[3], chunk[4]]);
-        let flags = chunk[5];
-
-        samples.push(PpiSample {
-            hr,
-            pp_in_ms,
-            pp_error_estimate,
-            blocker: flags & 0x01 != 0,
-            skin_contact: flags & 0x02 != 0,
-            skin_contact_supported: flags & 0x04 != 0,
-        });
-    }
-
-    Ok(samples)
-}
-
-/// Parses a PMD data frame (10-byte header followed by raw PPI samples) into
-/// PPI samples. The header is `[type(1)][timestamp(8)][frame_type(1)]`.
-///
-/// Returns the frame timestamp (microseconds) alongside the samples. The
-/// timestamp is the time of the *last* sample in the frame; earlier samples are
-/// spaced backward by their own PP intervals.
-pub(crate) fn parse_ppi_stream_frame(frame: &[u8]) -> PolarResult<(u64, Vec<PpiSample>)> {
-    if frame.len() <= PMD_FRAME_HEADER_LENGTH {
-        return Ok((0, Vec::new()));
-    }
-    let timestamp = u64::from_le_bytes(
-        frame[1..9]
-            .try_into()
-            .map_err(|_| Error::InvalidRecording)?,
-    );
-    let samples = parse_ppi_frame(&frame[PMD_FRAME_HEADER_LENGTH..])?;
-    Ok((timestamp, samples))
+    Ok(PpiRecord { start_time, samples })
 }
 
 #[cfg(test)]
@@ -232,7 +169,7 @@ mod test {
     fn parses_ppi_frame() {
         // hr=60, pp=1000ms, error=5ms, flags=0b111 (blocker + contact + supported)
         let frame = [60, 0xE8, 0x03, 0x05, 0x00, 0x07];
-        let samples = parse_ppi_frame(&frame).unwrap();
+        let samples = pmd::parse_ppi(&frame, 0).unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].hr, 60);
         assert_eq!(samples[0].pp_in_ms, 1000);
@@ -245,6 +182,6 @@ mod test {
     #[test]
     fn rejects_bad_frame_length() {
         let frame = [60, 0xE8, 0x03, 0x05];
-        assert!(parse_ppi_frame(&frame).is_err());
+        assert!(pmd::parse_ppi(&frame, 0).is_err());
     }
 }

@@ -6,17 +6,21 @@
 //! Files are transferred over the MTU characteristic using RFC76 message
 //! framing. Requests are protobuf-encoded `PbPFtpOperation` messages.
 
+use crate::connection::Connection;
 use crate::polar_uuid::{MeasurementType, PSFTP_D2H_UUID, PSFTP_MTU_UUID};
 use crate::{find_characteristic, Error, OfflineRecord, PolarResult};
 
 use btleplug::api::{Peripheral as _, WriteType};
-use btleplug::platform::Peripheral;
-use futures::stream::StreamExt;
 
 /// RFC76 frame status bits
 const STATUS_ERROR_OR_RESPONSE: u8 = 0x00;
 const STATUS_LAST: u8 = 0x01;
 const STATUS_MORE: u8 = 0x03;
+
+/// PFTP command opcodes
+const COMMAND_GET: u8 = 0;
+const COMMAND_PUT: u8 = 1;
+const COMMAND_REMOVE: u8 = 3;
 
 /// Root directory holding offline recordings on the device
 const RECORDINGS_ROOT: &str = "/U/0/";
@@ -29,8 +33,8 @@ const LED_CONFIG_PATH: &str = "/LEDCFG.BIN";
 /// The config file holds two bytes: the SDK-mode LED state and the PPI-mode LED
 /// state. The SDK-mode LED is left enabled while the PPI-mode LED is disabled
 /// so it does not blink during PPI measurements.
-pub(crate) async fn disable_ppi_led(device: &Peripheral) -> PolarResult<()> {
-    set_led(device, true, false).await
+pub(crate) async fn disable_ppi_led(conn: &Connection) -> PolarResult<()> {
+    set_led(conn, true, false).await
 }
 
 /// Writes the LED configuration to the device.
@@ -39,7 +43,7 @@ pub(crate) async fn disable_ppi_led(device: &Peripheral) -> PolarResult<()> {
 /// state (`0x01` = enabled, `0x00` = disabled). This is a persistent setting on
 /// the device.
 pub(crate) async fn set_led(
-    device: &Peripheral,
+    conn: &Connection,
     sdk_mode_led: bool,
     ppi_mode_led: bool,
 ) -> PolarResult<()> {
@@ -47,7 +51,7 @@ pub(crate) async fn set_led(
         if sdk_mode_led { 0x01 } else { 0x00 },
         if ppi_mode_led { 0x01 } else { 0x00 },
     ];
-    put_file(device, LED_CONFIG_PATH, &contents).await
+    put_file(conn, LED_CONFIG_PATH, &contents).await
 }
 
 /// Lists offline recordings by walking the device's directory tree.
@@ -56,13 +60,13 @@ pub(crate) async fn set_led(
 /// Each directory level is read with a PFTP GET that returns a protobuf
 /// `PbPFtpDirectory` listing its entries.
 pub(crate) async fn list_offline_recordings(
-    device: &Peripheral,
+    conn: &Connection,
 ) -> PolarResult<Vec<OfflineRecord>> {
     let mut records = Vec::new();
 
     // A device with no recordings reports error 103 (NO_SUCH_FILE_OR_DIRECTORY)
     // for the root directory, which we treat as an empty list.
-    let dates = match list_directory(device, RECORDINGS_ROOT).await {
+    let dates = match list_directory(conn, RECORDINGS_ROOT).await {
         Ok(entries) => entries,
         Err(Error::PftpError(103)) => return Ok(Vec::new()),
         Err(e) => return Err(e),
@@ -75,21 +79,21 @@ pub(crate) async fn list_offline_recordings(
         }
 
         let date_path = format!("{}{}", RECORDINGS_ROOT, date);
-        let subs = list_directory(device, &date_path).await?;
+        let subs = list_directory(conn, &date_path).await?;
         for (sub, _) in subs {
             if sub != "R/" {
                 continue;
             }
 
             let time_path = format!("{}{}", date_path, sub);
-            let times = list_directory(device, &time_path).await?;
+            let times = list_directory(conn, &time_path).await?;
             for (time, _) in times {
                 if time.len() != 7 || !time.ends_with('/') {
                     continue;
                 }
 
                 let rec_path = format!("{}{}", time_path, time);
-                let files = list_directory(device, &rec_path).await?;
+                let files = list_directory(conn, &rec_path).await?;
                 for (name, size) in files {
                     if !name.ends_with(".REC") {
                         continue;
@@ -116,8 +120,8 @@ pub(crate) async fn list_offline_recordings(
 
 /// Lists the entries of a directory via a PFTP GET and parses the returned
 /// `PbPFtpDirectory` protobuf into `(name, size)` pairs.
-async fn list_directory(device: &Peripheral, path: &str) -> PolarResult<Vec<(String, u64)>> {
-    let data = get_file(device, path).await?;
+async fn list_directory(conn: &Connection, path: &str) -> PolarResult<Vec<(String, u64)>> {
+    let data = get_file(conn, path).await?;
     parse_directory(&data)
 }
 
@@ -226,218 +230,29 @@ fn read_varint(data: &[u8], pos: usize) -> PolarResult<(u64, usize)> {
 }
 
 /// Downloads a file from the device over PS-FTP.
-pub(crate) async fn get_file(device: &Peripheral, path: &str) -> PolarResult<Vec<u8>> {
-    let mtu = find_characteristic(device, PSFTP_MTU_UUID).await?;
-    let d2h = find_characteristic(device, PSFTP_D2H_UUID).await?;
+pub(crate) async fn get_file(conn: &Connection, path: &str) -> PolarResult<Vec<u8>> {
+    let message = encode_message(path, COMMAND_GET, &[]);
+    log::info!("arctic: get_file({path:?}) message={message:02x?}");
 
-    device.subscribe(&mtu).await.map_err(Error::BleError)?;
-    device.subscribe(&d2h).await.map_err(Error::BleError)?;
-
-    // Build the protobuf PbPFtpOperation { command = GET (0), path = <path> }.
-    let operation = encode_pftp_operation(path);
-    // Prefix with RFC60 2-byte little-endian length.
-    let mut message = Vec::with_capacity(2 + operation.len());
-    message.push((operation.len() & 0xff) as u8);
-    message.push(((operation.len() >> 8) & 0x7f) as u8);
-    message.extend_from_slice(&operation);
-    log::info!(
-        "arctic: get_file({path:?}) operation={operation:02x?} message={message:02x?}"
-    );
-
-    // Get the notification stream before writing so the response is not missed.
-    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
-
-    // Split the message into RFC76 frames and write them. The first frame has
-    // the `next` bit clear; subsequent frames set it. The Polar PFTP MTU
-    // characteristic expects write-without-response for these data frames.
-    let mtu_size = mtu_size(device).await;
-    let mut seq = 0u8;
-    let mut offset = 0usize;
-    let mut next = 0u8;
-    loop {
-        let remaining = message.len() - offset;
-        let chunk_len = remaining.min(mtu_size - 1);
-        let last = remaining < mtu_size;
-
-        let mut frame = Vec::with_capacity(chunk_len + 1);
-        let status = if last { STATUS_LAST } else { STATUS_MORE };
-        frame.push((seq << 4) | (status << 1) | next);
-        frame.extend_from_slice(&message[offset..offset + chunk_len]);
-
-        device
-            .write(&mtu, &frame, WriteType::WithoutResponse)
-            .await
-            .map_err(Error::BleError)?;
-
-        offset += chunk_len;
-        seq = (seq + 1) & 0x0F;
-        next = 1;
-
-        if last {
-            break;
+    match transfer(conn, &message, ResponseMode::Payload).await? {
+        TransferResult::Payload(payload) => {
+            log::info!("arctic: get_file({path:?}) got {} bytes", payload.len());
+            Ok(payload)
         }
+        TransferResult::Ack => Ok(Vec::new()),
     }
-
-    // Read the response frames and reassemble the payload.
-    let mut payload = Vec::new();
-
-    loop {
-        // Guard against a device that never responds: time out after 10s.
-        let data = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            notifications.next(),
-        )
-        .await
-        {
-            Ok(Some(d)) if d.uuid == PSFTP_MTU_UUID => d.value,
-            Ok(Some(_)) => continue,
-            Ok(None) => return Err(Error::InvalidData),
-            Err(_) => return Err(Error::InvalidData),
-        };
-
-        if data.is_empty() {
-            return Err(Error::InvalidData);
-        }
-
-        let header = data[0];
-        let status = (header >> 1) & 0x03;
-        log::info!(
-            "arctic: get_file({path:?}) frame header={header:02x} status={status} len={}",
-            data.len()
-        );
-
-        match status {
-            STATUS_ERROR_OR_RESPONSE => {
-                let code = if data.len() >= 3 {
-                    data[1] as u16 | ((data[2] as u16) << 8)
-                } else {
-                    0
-                };
-                // error code 0 means the request succeeded.
-                if code == 0 {
-                    break;
-                }
-                return Err(Error::PftpError(code));
-            }
-            STATUS_LAST | STATUS_MORE => {
-                if data.len() > 1 {
-                    payload.extend_from_slice(&data[1..]);
-                }
-                if status == STATUS_LAST {
-                    break;
-                }
-            }
-            _ => return Err(Error::InvalidData),
-        }
-    }
-
-    log::info!("arctic: get_file({path:?}) got {} bytes", payload.len());
-    Ok(payload)
 }
 
 /// Removes a file or directory from the device over PS-FTP.
 ///
 /// The request uses the same framing as `get_file` but with a REMOVE command
 /// and no payload. The device responds with an error code (0 on success).
-pub(crate) async fn remove_file(device: &Peripheral, path: &str) -> PolarResult<()> {
-    let mtu = find_characteristic(device, PSFTP_MTU_UUID).await?;
-    let d2h = find_characteristic(device, PSFTP_D2H_UUID).await?;
-
-    device.subscribe(&mtu).await.map_err(Error::BleError)?;
-    device.subscribe(&d2h).await.map_err(Error::BleError)?;
-
-    // Build the protobuf PbPFtpOperation { command = REMOVE (3), path = <path> }.
-    let operation = encode_pftp_operation_with_command(path, 3);
-    // Prefix with RFC60 2-byte little-endian length.
-    let mut message = Vec::with_capacity(2 + operation.len());
-    message.push((operation.len() & 0xff) as u8);
-    message.push(((operation.len() >> 8) & 0x7f) as u8);
-    message.extend_from_slice(&operation);
-
-    // Get the notification stream before writing so the response is not missed.
-    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
-
-    // Split the message into RFC76 frames and write them.
-    let mtu_size = mtu_size(device).await;
-    let mut seq = 0u8;
-    let mut offset = 0usize;
-    let mut next = 0u8;
-    loop {
-        let remaining = message.len() - offset;
-        let chunk_len = remaining.min(mtu_size - 1);
-        let last = remaining < mtu_size;
-
-        let mut frame = Vec::with_capacity(chunk_len + 1);
-        let status = if last { STATUS_LAST } else { STATUS_MORE };
-        frame.push((seq << 4) | (status << 1) | next);
-        frame.extend_from_slice(&message[offset..offset + chunk_len]);
-
-        device
-            .write(&mtu, &frame, WriteType::WithoutResponse)
-            .await
-            .map_err(Error::BleError)?;
-
-        offset += chunk_len;
-        seq = (seq + 1) & 0x0F;
-        next = 1;
-
-        if last {
-            break;
-        }
+pub(crate) async fn remove_file(conn: &Connection, path: &str) -> PolarResult<()> {
+    let message = encode_message(path, COMMAND_REMOVE, &[]);
+    match transfer(conn, &message, ResponseMode::Ack).await? {
+        TransferResult::Ack => Ok(()),
+        TransferResult::Payload(_) => Ok(()),
     }
-
-    // Read the response frame and check for errors.
-    loop {
-        let data = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            notifications.next(),
-        )
-        .await
-        {
-            Ok(Some(d)) if d.uuid == PSFTP_MTU_UUID => d.value,
-            Ok(Some(_)) => continue,
-            Ok(None) => return Err(Error::InvalidData),
-            Err(_) => return Err(Error::InvalidData),
-        };
-
-        if data.is_empty() {
-            return Err(Error::InvalidData);
-        }
-
-        let header = data[0];
-        let status = (header >> 1) & 0x03;
-
-        match status {
-            STATUS_ERROR_OR_RESPONSE => {
-                let code = if data.len() >= 3 {
-                    data[1] as u16 | ((data[2] as u16) << 8)
-                } else {
-                    0
-                };
-                if code == 0 {
-                    return Ok(());
-                }
-                return Err(Error::PftpError(code));
-            }
-            _ => return Err(Error::InvalidData),
-        }
-    }
-}
-
-/// Encodes a `PbPFtpOperation` protobuf message with a GET command.
-fn encode_pftp_operation(path: &str) -> Vec<u8> {
-    encode_pftp_operation_with_command(path, 0)
-}
-
-/// Encodes a `PbPFtpOperation` protobuf message with the given command.
-///
-/// The command is a varint: GET = 0, PUT = 1, REMOVE = 3.
-fn encode_pftp_operation_with_command(path: &str, command: u8) -> Vec<u8> {
-    // field 1 (command) = varint 0x08, value <command>;
-    // field 2 (path) = length-delimited 0x12, length, string bytes.
-    let mut out = vec![0x08, command, 0x12, path.len() as u8];
-    out.extend_from_slice(path.as_bytes());
-    out
 }
 
 /// Uploads a file to the device over PS-FTP.
@@ -446,32 +261,53 @@ fn encode_pftp_operation_with_command(path: &str, command: u8) -> Vec<u8> {
 /// the file contents are streamed as a single RFC76 message: header frames
 /// first (with the `next` bit clear on the first frame), then the data frames.
 pub(crate) async fn put_file(
-    device: &Peripheral,
+    conn: &Connection,
     path: &str,
     contents: &[u8],
 ) -> PolarResult<()> {
-    let mtu = find_characteristic(device, PSFTP_MTU_UUID).await?;
-    let d2h = find_characteristic(device, PSFTP_D2H_UUID).await?;
+    let message = encode_message(path, COMMAND_PUT, contents);
+    match transfer(conn, &message, ResponseMode::Ack).await? {
+        TransferResult::Ack => Ok(()),
+        TransferResult::Payload(_) => Ok(()),
+    }
+}
 
-    device.subscribe(&mtu).await.map_err(Error::BleError)?;
-    device.subscribe(&d2h).await.map_err(Error::BleError)?;
+/// Whether a transfer expects a data payload or just an acknowledgement.
+enum ResponseMode {
+    /// Collect response frames into a payload until the last frame.
+    Payload,
+    /// Expect a single acknowledgement frame.
+    Ack,
+}
 
-    // Build the protobuf PbPFtpOperation { command = PUT (1), path = <path> }.
-    let operation = encode_pftp_operation_with_command(path, 1);
-    // Prefix with RFC60 2-byte little-endian length.
-    let mut message = Vec::with_capacity(2 + operation.len() + contents.len());
-    message.push((operation.len() & 0xff) as u8);
-    message.push(((operation.len() >> 8) & 0x7f) as u8);
-    message.extend_from_slice(&operation);
-    message.extend_from_slice(contents);
+/// The result of a PS-FTP transfer.
+enum TransferResult {
+    /// A reassembled data payload.
+    Payload(Vec<u8>),
+    /// A success acknowledgement with no payload.
+    Ack,
+}
 
-    // Get the notification stream before writing so the response is not missed.
-    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
+/// Sends a PS-FTP message and reads the response.
+///
+/// The MTU and D2H characteristics are subscribed for the duration of the
+/// transfer. Response frames are delivered by the connection's notification
+/// dispatcher.
+async fn transfer(
+    conn: &Connection,
+    message: &[u8],
+    mode: ResponseMode,
+) -> PolarResult<TransferResult> {
+    let mtu = find_characteristic(conn.device(), PSFTP_MTU_UUID).await?;
+    let _d2h = find_characteristic(conn.device(), PSFTP_D2H_UUID).await?;
+
+    let mut rx = conn.subscribe(PSFTP_MTU_UUID).await?;
+    let mut disconnected = conn.disconnected();
 
     // Split the message into RFC76 frames and write them. The first frame has
-    // the `next` bit clear; subsequent frames set it. Host-to-device frames set
-    // the direction bit (status 0x06 for MORE, 0x02 for LAST).
-    let mtu_size = mtu_size(device).await;
+    // the `next` bit clear; subsequent frames set it. The Polar PFTP MTU
+    // characteristic expects write-without-response for these data frames.
+    let mtu_size = mtu_size();
     let mut seq = 0u8;
     let mut offset = 0usize;
     let mut next = 0u8;
@@ -481,11 +317,11 @@ pub(crate) async fn put_file(
         let last = remaining < mtu_size;
 
         let mut frame = Vec::with_capacity(chunk_len + 1);
-        let status = if last { 0x02 } else { 0x06 };
-        frame.push((seq << 4) | status | next);
+        let status = if last { STATUS_LAST } else { STATUS_MORE };
+        frame.push((seq << 4) | (status << 1) | next);
         frame.extend_from_slice(&message[offset..offset + chunk_len]);
 
-        device
+        conn.device()
             .write(&mtu, &frame, WriteType::WithoutResponse)
             .await
             .map_err(Error::BleError)?;
@@ -499,18 +335,16 @@ pub(crate) async fn put_file(
         }
     }
 
-    // Read the response frame and check for errors.
+    let mut payload = Vec::new();
     loop {
-        let data = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            notifications.next(),
-        )
-        .await
-        {
-            Ok(Some(d)) if d.uuid == PSFTP_MTU_UUID => d.value,
-            Ok(Some(_)) => continue,
-            Ok(None) => return Err(Error::InvalidData),
-            Err(_) => return Err(Error::InvalidData),
+        let data = tokio::select! {
+            _ = disconnected.recv() => return Err(Error::Disconnected),
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()) => {
+                match result {
+                    Ok(Some(data)) => data,
+                    Ok(None) | Err(_) => return Err(Error::InvalidData),
+                }
+            }
         };
 
         if data.is_empty() {
@@ -527,18 +361,47 @@ pub(crate) async fn put_file(
                 } else {
                     0
                 };
-                if code == 0 {
-                    return Ok(());
+                if code != 0 {
+                    return Err(Error::PftpError(code));
                 }
-                return Err(Error::PftpError(code));
+                return Ok(match mode {
+                    ResponseMode::Payload => TransferResult::Payload(payload),
+                    ResponseMode::Ack => TransferResult::Ack,
+                });
+            }
+            STATUS_LAST | STATUS_MORE => {
+                if data.len() > 1 {
+                    payload.extend_from_slice(&data[1..]);
+                }
+                if status == STATUS_LAST {
+                    return Ok(TransferResult::Payload(payload));
+                }
             }
             _ => return Err(Error::InvalidData),
         }
     }
 }
 
+/// Encodes a `PbPFtpOperation` message with a 2-byte length prefix and payload.
+///
+/// The operation is a protobuf message:
+/// field 1 (command) = varint, field 2 (path) = length-delimited string.
+/// The command is a varint: GET = 0, PUT = 1, REMOVE = 3.
+fn encode_message(path: &str, command: u8, contents: &[u8]) -> Vec<u8> {
+    let mut operation = vec![0x08, command, 0x12, path.len() as u8];
+    operation.extend_from_slice(path.as_bytes());
+
+    // Prefix with RFC60 2-byte little-endian length.
+    let mut message = Vec::with_capacity(2 + operation.len() + contents.len());
+    message.push((operation.len() & 0xff) as u8);
+    message.push(((operation.len() >> 8) & 0x7f) as u8);
+    message.extend_from_slice(&operation);
+    message.extend_from_slice(contents);
+    message
+}
+
 /// Determines the ATT MTU size to use for framing.
-async fn mtu_size(_device: &Peripheral) -> usize {
+fn mtu_size() -> usize {
     // The Polar SDK uses an MTU of 20 (the default ATT MTU of 23 minus the 3-byte
     // ATT header), leaving 19 payload bytes per RFC76 frame. Requests larger than
     // 19 bytes must be split across multiple frames; using a larger value here

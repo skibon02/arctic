@@ -1,0 +1,9 @@
+[package]
+name = "stream"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arctic = { path = "../.." }
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

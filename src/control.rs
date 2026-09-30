@@ -1,18 +1,20 @@
 //! # Control
 //!
-//! Commands sent over the PMD control point to start and stop offline
-//! recording.
+//! Commands sent over the PMD control point: starting and stopping offline
+//! recording, requesting stream settings, and starting and stopping online
+//! streaming.
 
+use crate::connection::Connection;
 use crate::polar_uuid::{MeasurementType, PMD_CP_UUID, PMD_DATA_UUID};
-use crate::{find_characteristic, Error, PolarResult};
+use crate::settings::StreamSettings;
+use crate::{Error, PolarResult};
 
 use btleplug::api::{Peripheral as _, WriteType};
-use btleplug::platform::Peripheral;
-use futures::stream::StreamExt;
 
 /// Control point command opcodes (client to service)
 const REQUEST_MEASUREMENT_START: u8 = 0x02;
 const STOP_MEASUREMENT: u8 = 0x03;
+const GET_MEASUREMENT_SETTINGS: u8 = 0x01;
 const GET_MEASUREMENT_STATUS: u8 = 0x05;
 
 /// Bit set in the type byte to request offline (vs online) recording
@@ -27,10 +29,15 @@ const OFFLINE_ACTIVE: u8 = 0x80;
 
 /// Control point response marker byte
 const CP_RESPONSE: u8 = 0xF0;
+/// Control point command byte sent by the device when a stream stops
+const ONLINE_MEASUREMENT_STOPPED: u8 = 0xF1;
+
+/// Error code returned when the device is already in the requested state
+pub(crate) const ERROR_ALREADY_IN_STATE: u8 = 6;
 
 /// Starts offline recording of the given measurement type.
 pub(crate) async fn start_offline_recording(
-    device: &Peripheral,
+    conn: &Connection,
     ty: MeasurementType,
     secret: Option<&[u8]>,
 ) -> PolarResult<()> {
@@ -46,33 +53,65 @@ pub(crate) async fn start_offline_recording(
         command.extend_from_slice(key);
     }
 
-    let response = send_command(device, command).await?;
+    let response = send_command(conn, command).await?;
     ensure_success(&response)?;
     Ok(())
 }
 
 /// Stops the measurement of the given type.
-pub(crate) async fn stop_measurement(device: &Peripheral, ty: MeasurementType) -> PolarResult<()> {
-    let response = send_command(device, vec![STOP_MEASUREMENT, ty.as_u8()]).await?;
-    ensure_success(&response)?;
-    Ok(())
+///
+/// If the device reports "already in state" (error 6), the measurement is
+/// already stopped and the request is treated as a no-op success.
+pub(crate) async fn stop_measurement(conn: &Connection, ty: MeasurementType) -> PolarResult<()> {
+    let response = send_command(conn, vec![STOP_MEASUREMENT, ty.as_u8()]).await?;
+    match response.error_code {
+        0 | ERROR_ALREADY_IN_STATE => Ok(()),
+        code => Err(Error::ControlPointError(code)),
+    }
 }
 
-/// Starts online (streaming) measurement of the given type.
-///
-/// Unlike offline recording, online streaming sends data continuously over the
-/// PMD data characteristic while the connection is open. The device uses its
-/// default settings when none are supplied.
-///
-/// If the device reports "already in state" (error 6), streaming is already
-/// active and the request is treated as a no-op success.
-pub(crate) async fn start_online_streaming(
-    device: &Peripheral,
+/// Requests the stream settings available for the given measurement type.
+pub(crate) async fn request_stream_settings(
+    conn: &Connection,
     ty: MeasurementType,
+) -> PolarResult<StreamSettings> {
+    let response = send_command(
+        conn,
+        vec![GET_MEASUREMENT_SETTINGS, ty.as_u8()],
+    )
+    .await?;
+    ensure_success(&response)?;
+    StreamSettings::parse_available(&response.parameters)
+}
+
+/// Starts online (streaming) measurement of the given type with the given
+/// settings, returning the settings the device reports for the active stream.
+///
+/// If the device reports "already in state" (error 6), a measurement of this
+/// type is already running, possibly left over from an earlier session. It is
+/// stopped and the start is retried so that the device streams to this session
+/// with the requested settings.
+pub(crate) async fn start_online_streaming(
+    conn: &Connection,
+    ty: MeasurementType,
+    settings: &mut StreamSettings,
 ) -> PolarResult<()> {
-    let response = send_command(device, vec![REQUEST_MEASUREMENT_START, ty.as_u8()]).await?;
+    let mut command = vec![REQUEST_MEASUREMENT_START, ty.as_u8()];
+    command.extend_from_slice(&settings.encode_selected());
+
+    let response = send_command(conn, command.clone()).await?;
     match response.error_code {
-        0 | 6 => Ok(()),
+        0 => {
+            settings.update_from_start_response(&response.parameters)?;
+            Ok(())
+        }
+        ERROR_ALREADY_IN_STATE => {
+            stop_measurement(conn, ty).await?;
+            let response = send_command(conn, command).await?;
+            ensure_success(&response)?;
+            settings.update_from_start_response(&response.parameters)?;
+            Ok(())
+        }
         code => Err(Error::ControlPointError(code)),
     }
 }
@@ -81,18 +120,18 @@ pub(crate) async fn start_online_streaming(
 ///
 /// Returns the raw parameter bytes of the response, each encoding a measurement
 /// type (low 6 bits) and its active state (high 2 bits).
-pub(crate) async fn get_measurement_status(device: &Peripheral) -> PolarResult<Vec<u8>> {
-    let response = send_command(device, vec![GET_MEASUREMENT_STATUS]).await?;
+pub(crate) async fn get_measurement_status(conn: &Connection) -> PolarResult<Vec<u8>> {
+    let response = send_command(conn, vec![GET_MEASUREMENT_STATUS]).await?;
     ensure_success(&response)?;
     Ok(response.parameters)
 }
 
 /// Returns whether an offline recording of the given type is currently active.
 pub(crate) async fn is_offline_recording_active(
-    device: &Peripheral,
+    conn: &Connection,
     ty: MeasurementType,
 ) -> PolarResult<bool> {
-    let status = get_measurement_status(device).await?;
+    let status = get_measurement_status(conn).await?;
     let type_byte = ty.as_u8();
 
     Ok(status.iter().any(|byte| {
@@ -102,75 +141,77 @@ pub(crate) async fn is_offline_recording_active(
 }
 
 /// Writes a command to the PMD control point and waits for the response.
-async fn send_command(device: &Peripheral, command: Vec<u8>) -> PolarResult<ControlResponse> {
-    let characteristic = find_characteristic(device, PMD_CP_UUID).await?;
-    device
-        .subscribe(&characteristic)
-        .await
-        .map_err(Error::BleError)?;
-
+///
+/// The control point and data characteristics are subscribed for the duration
+/// of the call. The control point response is delivered by the connection's
+/// notification dispatcher.
+async fn send_command(conn: &Connection, command: Vec<u8>) -> PolarResult<ControlResponse> {
     // The PMD data characteristic must also be subscribed before the control
     // point accepts commands.
-    let data_char = find_characteristic(device, PMD_DATA_UUID).await?;
-    device.subscribe(&data_char).await.map_err(Error::BleError)?;
+    let mut cp_rx = conn.subscribe(PMD_CP_UUID).await?;
+    let _data_rx = conn.subscribe(PMD_DATA_UUID).await?;
 
-    // Get the notification stream before writing so the response is not missed.
-    let mut notifications = device.notifications().await.map_err(Error::BleError)?;
+    let characteristic = crate::find_characteristic(conn.device(), PMD_CP_UUID).await?;
+    let mut disconnected = conn.disconnected();
 
-    device
+    conn.device()
         .write(&characteristic, &command, WriteType::WithResponse)
         .await
         .map_err(Error::BleError)?;
 
     loop {
-        let data = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            notifications.next(),
-        )
-        .await
-        {
-            Ok(Some(d)) => d,
-            Ok(None) => {
-                log::error!("arctic: send_command: notification stream ended");
-                return Err(Error::InvalidData);
+        tokio::select! {
+            _ = disconnected.recv() => {
+                return Err(Error::Disconnected);
             }
-            Err(_) => {
-                log::error!("arctic: send_command: timed out waiting for control point response");
-                return Err(Error::InvalidData);
+            notification = tokio::time::timeout(std::time::Duration::from_secs(10), cp_rx.recv()) => {
+                match notification {
+                    Ok(Some(value)) => {
+                        log::debug!("arctic: send_command: response={:02x?}", value);
+                        if value.first() == Some(&CP_RESPONSE) {
+                            return ControlResponse::new(&value);
+                        }
+                    }
+                    Ok(None) => {
+                        log::error!("arctic: send_command: control point channel closed");
+                        return Err(Error::InvalidData);
+                    }
+                    Err(_) => {
+                        log::error!("arctic: send_command: timed out waiting for response");
+                        return Err(Error::InvalidData);
+                    }
+                }
             }
-        };
-        log::info!(
-            "arctic: send_command: notification uuid={} value={:02x?}",
-            data.uuid,
-            data.value
-        );
-        if data.uuid == PMD_CP_UUID && data.value.first() == Some(&CP_RESPONSE) {
-            return ControlResponse::new(&data.value);
         }
     }
 }
 
 /// A parsed response from the PMD control point.
-struct ControlResponse {
-    error_code: u8,
-    parameters: Vec<u8>,
+pub(crate) struct ControlResponse {
+    pub(crate) error_code: u8,
+    pub(crate) parameters: Vec<u8>,
 }
 
 impl ControlResponse {
     fn new(data: &[u8]) -> PolarResult<ControlResponse> {
         // Layout: [0xF0, opcode, type, error_code, more, params...]
-        if data.len() < 4 || data[0] != CP_RESPONSE {
+        if data.len() < 5 || data[0] != CP_RESPONSE {
             return Err(Error::InvalidData);
         }
-        let parameters = if data.len() > 5 {
-            data[5..].to_vec()
-        } else {
-            Vec::new()
-        };
         Ok(ControlResponse {
             error_code: data[3],
-            parameters,
+            parameters: data[5..].to_vec(),
         })
+    }
+}
+
+/// Returns the measurement type from a device-initiated stop command, if the
+/// notification is one.
+pub(crate) fn parse_online_measurement_stopped(data: &[u8]) -> Option<MeasurementType> {
+    if data.first() == Some(&ONLINE_MEASUREMENT_STOPPED) {
+        data.get(1).and_then(|byte| MeasurementType::from_id(*byte))
+    } else {
+        None
     }
 }
 
