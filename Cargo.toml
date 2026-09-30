@@ -16,15 +16,17 @@ name = "arctic"
 path = "src/lib.rs"
 
 [dependencies]
-btleplug = { path = "../btleplug" }
+btleplug = { version = "0.13.3" }
 futures = "0.3"
 log = "0.4"
 tokio = { version = "1.10.0", features = ["macros", "rt", "rt-multi-thread", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 uuid = "1"
 
+# Used by init_android to bind the JavaVM before handing it to btleplug's
+# droidplug backend.
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.19"
+jni = "0.22"
 
 [dev-dependencies]
 tokio-test = "0.4"

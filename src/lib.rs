@@ -56,52 +56,22 @@ pub use polar_uuid::MeasurementType;
 /// Initializes the btleplug Android backend.
 ///
 /// On Android, btleplug's `droidplug` backend must be initialized with a JNI
-/// environment and the activity's class loader before any Bluetooth operation.
-/// This binds the given `JavaVM` pointer into btleplug's global state and
-/// registers its native callbacks.
+/// environment before any Bluetooth operation. This binds the given `JavaVM`
+/// pointer into btleplug's global state and registers its native callbacks.
 ///
 /// Must be called once, before constructing a [`PolarSensor`].
 ///
 /// # Safety
 ///
-/// `vm` must be a valid pointer to a `JavaVM` and `activity` a valid pointer to
-/// an `android.app.Activity` for the lifetime of the process.
+/// `vm` must be a valid pointer to a `JavaVM` for the lifetime of the process.
 #[cfg(target_os = "android")]
-pub fn init_android(vm: *mut std::ffi::c_void, activity: *mut std::ffi::c_void) -> PolarResult<()> {
+pub fn init_android(vm: *mut std::ffi::c_void) -> PolarResult<()> {
     use jni::JavaVM;
 
-    let vm = unsafe { JavaVM::from_raw(vm as *mut jni::sys::JavaVM) }
-        .map_err(|_| Error::BleError(btleplug::Error::RuntimeError("invalid JavaVM pointer".into())))?;
-    let env = vm.attach_current_thread_permanently().map_err(|_| {
-        Error::BleError(btleplug::Error::RuntimeError("failed to attach JNI thread".into()))
-    })?;
+    let vm = unsafe { JavaVM::from_raw(vm as *mut jni::sys::JavaVM) };
 
-    // Resolve the activity's class loader so btleplug can load its Java shim
-    // classes (bundled in classes.dex) despite FindClass using the system loader
-    // on a NativeActivity.
-    let class_loader = {
-        let activity = jni::objects::JObject::from(activity as jni::sys::jobject);
-        // Context.getClassLoader() returns the app class loader, which sees the
-        // classes.dex bundled in the APK. (activity.getClass().getClassLoader()
-        // would return the boot loader since NativeActivity is a system class.)
-        env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
-            .and_then(|v| v.l())
-            .map_err(|_| Error::BleError(btleplug::Error::RuntimeError("failed to get class loader".into())))?
-    };
-
-    match btleplug::platform::init(&env, &class_loader) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Surface any pending JNI exception description to aid debugging.
-            if env.exception_check().unwrap_or(false) {
-                if let Ok(throwable) = env.exception_occurred() {
-                    let _ = env.exception_clear();
-                    let _ = env.call_method(throwable, "printStackTrace", "()V", &[]);
-                }
-            }
-            Err(Error::BleError(e))
-        }
-    }
+    vm.attach_current_thread(|env| btleplug::platform::init(env))
+        .map_err(Error::BleError)
 }
 
 /// Error type for general errors and BLE errors from btleplug
