@@ -401,8 +401,10 @@ impl PolarSensor {
     /// measurement, or when a frame cannot be parsed. Dropping the stream stops
     /// the measurement on the device.
     ///
-    /// The Verity Sense supports only one stream at a time for most types. Use
-    /// [`PolarSensor::stop_streaming`] to stop a stream explicitly.
+    /// Streams of several measurement types may run concurrently. Each stream
+    /// receives only the frames of its own type, and stopping or dropping one
+    /// stream leaves the others running. Use [`PolarSensor::stop_streaming`] to
+    /// stop a stream explicitly.
     ///
     /// # Errors
     ///
@@ -417,6 +419,8 @@ impl PolarSensor {
     }
 
     /// Stops online streaming of the given measurement type.
+    ///
+    /// Only the given type is stopped; streams of other types keep running.
     ///
     /// # Errors
     ///
@@ -460,12 +464,12 @@ impl PolarSensor {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::NotConnected`] if not connected, or
-    /// [`Error::BleError`] if the unsubscribe fails.
+    /// Returns [`Error::NotConnected`] if not connected.
     pub async fn stop_hr_streaming(&self) -> PolarResult<()> {
         self.connection()?
-            .unsubscribe(polar_uuid::HEART_RATE_MEASUREMENT_UUID)
-            .await
+            .release_all(polar_uuid::HEART_RATE_MEASUREMENT_UUID)
+            .await;
+        Ok(())
     }
 
     /// Scans for and returns all matching Polar devices (name and device id).

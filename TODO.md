@@ -18,6 +18,7 @@
 - [x] Stream MAG samples (delta frames, calibration status)
 - [x] Per-sample timestamps for ACC, GYRO, and MAG
 - [x] Stop on drop, device-initiated stop, and disconnect
+- [x] Concurrent streams of multiple types (fan-out on PMD data, independent stop)
 
 ## Future work
 

@@ -27,6 +27,7 @@ optional type (`acc`, `gyro`, `mag`, or `ppi`) as command line arguments.
 ## `monitor`
 
 Scans for the first Polar Verity Sense (max 5 seconds), connects, and streams
-each measurement type in turn: PPI samples are printed, ACC and MAG samples are
-averaged, and GYRO samples are reported as per-axis minimum and maximum, once
-per second. Press Ctrl+C to stop and disconnect. No arguments are required.
+all requested measurement types concurrently: PPI samples are printed, ACC and
+MAG samples are averaged, and GYRO samples are reported as per-axis minimum and
+maximum, once per second. Press Ctrl+C to stop and disconnect. No arguments are
+required.

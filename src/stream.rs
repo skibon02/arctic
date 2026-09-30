@@ -6,12 +6,19 @@
 //! the start command with the selected settings, and then feeding parsed frames
 //! into a channel. The returned stream is the receiving end of that channel.
 //!
-//! The stream ends, with an error, when:
+//! Several streams may run at once, one per measurement type. They all share
+//! the PMD data and control point characteristics; the connection fans every
+//! notification out to each stream, and each stream decodes only the frames and
+//! stop commands that match its own type. Stopping or dropping one stream
+//! leaves the others running.
+//!
+//! A stream ends, with an error, when:
 //!
 //! * the device disconnects,
 //! * the device stops the measurement on its own,
 //! * a frame cannot be parsed, or
-//! * the consumer drops the stream (in which case the device is told to stop).
+//! * the consumer drops the stream (in which case the device is told to stop
+//!   that measurement type only).
 
 use crate::connection::Connection;
 use crate::control;
@@ -90,9 +97,9 @@ pub(crate) async fn start(
     control::start_online_streaming(conn, ty, &mut settings).await?;
 
     // Subscribe to the data and control point characteristics after starting.
-    // The start command registers its own routes for these characteristics and
-    // drops their receivers on return, so subscribing afterwards is required to
-    // receive frames and device-initiated stop commands.
+    // Subscriptions fan out, so every active stream receives every PMD data
+    // frame and every control point notification; each stream decodes only the
+    // frames and stop commands that match its own measurement type.
     let mut data_rx = conn.subscribe(PMD_DATA_UUID).await?;
     let mut cp_rx = conn.subscribe(PMD_CP_UUID).await?;
 
@@ -114,9 +121,9 @@ pub(crate) async fn start(
                     return;
                 }
                 Some(data) = cp_rx.recv() => {
-                    // The device can stop the measurement on its own.
+                    // The device can stop one or more measurements on its own.
                     if let Some(stopped) = control::parse_online_measurement_stopped(&data) {
-                        if stopped == ty {
+                        if stopped.contains(&ty) {
                             let _ = tx.send(Err(Error::StreamStopped)).await;
                             return;
                         }

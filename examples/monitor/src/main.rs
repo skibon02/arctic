@@ -1,8 +1,8 @@
-//! Example: scan for the first Polar Verity Sense, connect, and stream
-//! measurement data until interrupted.
+//! Example: scan for the first Polar Verity Sense, connect, and stream every
+//! requested measurement type concurrently until interrupted.
 //!
-//! The Verity Sense supports only one PMD stream at a time, so each measurement
-//! type is streamed in turn. For every elapsed second:
+//! All selected types stream at the same time; each stream yields only its own
+//! frames. For every elapsed second:
 //!
 //! * PPI samples are printed individually,
 //! * ACC samples are averaged,
@@ -13,13 +13,13 @@
 //!
 //! Usage: `cargo run -p monitor [-- --once] [--phase <secs>] [--types <list>]`
 //!
-//! * `--once` runs each measurement type once and exits, instead of looping.
-//! * `--phase <secs>` sets how long each type is streamed (default 10).
+//! * `--once` streams for one phase and exits, instead of looping.
+//! * `--phase <secs>` sets how long to stream (default 10).
 //! * `--types <list>` selects the types to stream, comma-separated
 //!   (default `ppi,acc,mag,gyro`).
 
 use arctic::{MeasurementType, PolarSensor, StreamFrame};
-use futures::stream::StreamExt;
+use futures::stream::{BoxStream, StreamExt};
 use std::time::Duration;
 
 /// Scan for at most this long before giving up.
@@ -67,20 +67,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected.");
 
     loop {
-        for &ty in &types {
-            println!("\n=== Streaming {:?} for {}s ===", ty, phase_duration.as_secs());
-            let interrupted = match stream_phase(&sensor, ty, phase_duration).await {
-                Ok(interrupted) => interrupted,
-                Err(why) => {
-                    eprintln!("Stream error: {:?}", why);
-                    false
-                }
-            };
-            if interrupted {
-                println!("\nInterrupted. Disconnecting...");
-                sensor.disconnect().await;
-                return Ok(());
+        let interrupted = match stream_phase(&sensor, &types, phase_duration).await {
+            Ok(interrupted) => interrupted,
+            Err(why) => {
+                eprintln!("Stream error: {:?}", why);
+                false
             }
+        };
+        if interrupted {
+            println!("\nInterrupted. Disconnecting...");
+            sensor.disconnect().await;
+            return Ok(());
         }
         if once {
             break;
@@ -103,25 +100,33 @@ fn parse_type(name: &str) -> MeasurementType {
     }
 }
 
-/// Streams a single measurement type for [`PHASE_DURATION`] or until Ctrl+C.
+/// Streams every requested type concurrently for `phase_duration` or until
+/// Ctrl+C.
 ///
-/// Returns whether the stream was interrupted by Ctrl+C.
+/// Returns whether the streams were interrupted by Ctrl+C.
 async fn stream_phase(
     sensor: &PolarSensor,
-    ty: MeasurementType,
+    types: &[MeasurementType],
     phase_duration: Duration,
 ) -> arctic::PolarResult<bool> {
-    let mut settings = sensor.request_stream_settings(ty).await?;
-    println!(
-        "settings: rates={:?} resolutions={:?} ranges={:?} channels={:?}",
-        settings.sample_rates(),
-        settings.resolutions(),
-        settings.ranges(),
-        settings.channels()
-    );
-    settings.select_max();
+    let mut streams: Vec<(MeasurementType, BoxStream<'static, arctic::PolarResult<StreamFrame>>)> =
+        Vec::new();
 
-    let mut stream = sensor.start_streaming(ty, settings).await?;
+    for &ty in types {
+        let mut settings = sensor.request_stream_settings(ty).await?;
+        println!(
+            "settings {:?}: rates={:?} resolutions={:?} ranges={:?} channels={:?}",
+            ty,
+            settings.sample_rates(),
+            settings.resolutions(),
+            settings.ranges(),
+            settings.channels()
+        );
+        settings.select_max();
+        let stream = sensor.start_streaming(ty, settings).await?;
+        streams.push((ty, stream));
+    }
+
     let deadline = tokio::time::Instant::now() + phase_duration;
     let mut window = Window::new();
     let mut interrupted = false;
@@ -134,6 +139,12 @@ async fn stream_phase(
     tokio::pin!(sleep);
 
     loop {
+        // Poll every stream for the next frame. `next()` is cancel-safe, so a
+        // frame buffered in a stream that loses the race is not lost.
+        let next = futures::future::select_all(
+            streams.iter_mut().map(|(_, stream)| stream.next()),
+        );
+
         tokio::select! {
             _ = &mut ctrl_c => {
                 interrupted = true;
@@ -141,20 +152,18 @@ async fn stream_phase(
             }
             _ = &mut sleep => {
                 eprintln!("arctic: phase deadline reached");
-                window.flush();
                 break;
             }
-            frame = stream.next() => {
+            (frame, index, _) = next => {
+                let (ty, _) = &streams[index];
                 match frame {
                     Some(Ok(frame)) => window.push(frame),
                     Some(Err(why)) => {
-                        eprintln!("arctic: phase stream error: {why:?}");
-                        window.flush();
-                        sensor.stop_streaming(ty).await?;
-                        return Err(why);
+                        eprintln!("arctic: {ty:?} stream error: {why:?}");
+                        break;
                     }
                     None => {
-                        eprintln!("arctic: phase stream ended (None)");
+                        eprintln!("arctic: {ty:?} stream ended (None)");
                         break;
                     }
                 }
@@ -162,7 +171,15 @@ async fn stream_phase(
         }
     }
 
-    sensor.stop_streaming(ty).await?;
+    window.flush();
+
+    // Stop each type independently; the others are unaffected.
+    for (ty, _) in &streams {
+        if let Err(why) = sensor.stop_streaming(*ty).await {
+            eprintln!("arctic: stop {ty:?} failed: {why:?}");
+        }
+    }
+
     Ok(interrupted)
 }
 

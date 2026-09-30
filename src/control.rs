@@ -144,18 +144,30 @@ pub(crate) async fn is_offline_recording_active(
 ///
 /// The control point and data characteristics are subscribed for the duration
 /// of the call. The control point response is delivered by the connection's
-/// notification dispatcher.
+/// notification dispatcher. Commands are serialized so that concurrent streams
+/// and stream control calls do not read each other's responses.
 async fn send_command(conn: &Connection, command: Vec<u8>) -> PolarResult<ControlResponse> {
+    let _guard = conn.lock_control_point().await;
+
     // The PMD data characteristic must also be subscribed before the control
     // point accepts commands.
     let mut cp_rx = conn.subscribe(PMD_CP_UUID).await?;
     let _data_rx = conn.subscribe(PMD_DATA_UUID).await?;
 
+    await_response(conn, &command, &mut cp_rx).await
+}
+
+/// Writes a command and waits for the control point response.
+async fn await_response(
+    conn: &Connection,
+    command: &[u8],
+    cp_rx: &mut crate::connection::Subscription,
+) -> PolarResult<ControlResponse> {
     let characteristic = crate::find_characteristic(conn.device(), PMD_CP_UUID).await?;
     let mut disconnected = conn.disconnected();
 
     conn.device()
-        .write(&characteristic, &command, WriteType::WithResponse)
+        .write(&characteristic, command, WriteType::WithResponse)
         .await
         .map_err(Error::BleError)?;
 
@@ -205,14 +217,21 @@ impl ControlResponse {
     }
 }
 
-/// Returns the measurement type from a device-initiated stop command, if the
+/// Returns the measurement types from a device-initiated stop command, if the
 /// notification is one.
-pub(crate) fn parse_online_measurement_stopped(data: &[u8]) -> Option<MeasurementType> {
-    if data.first() == Some(&ONLINE_MEASUREMENT_STOPPED) {
-        data.get(1).and_then(|byte| MeasurementType::from_id(*byte))
-    } else {
-        None
+///
+/// The device reports every type it stopped in a single notification, so the
+/// returned iterator may yield more than one type.
+pub(crate) fn parse_online_measurement_stopped(data: &[u8]) -> Option<Vec<MeasurementType>> {
+    if data.first() != Some(&ONLINE_MEASUREMENT_STOPPED) {
+        return None;
     }
+    Some(
+        data[1..]
+            .iter()
+            .filter_map(|byte| MeasurementType::from_id(*byte))
+            .collect(),
+    )
 }
 
 fn ensure_success(response: &ControlResponse) -> PolarResult<()> {
@@ -220,5 +239,33 @@ fn ensure_success(response: &ControlResponse) -> PolarResult<()> {
         Ok(())
     } else {
         Err(Error::ControlPointError(response.error_code))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn parses_single_type_stop() {
+        // 0xF1 = online measurement stopped, 0x02 = ACC.
+        let stopped = parse_online_measurement_stopped(&[0xF1, 0x02]).unwrap();
+        assert_eq!(stopped, vec![MeasurementType::Acc]);
+    }
+
+    #[test]
+    fn parses_multiple_type_stop() {
+        // The device may report several stopped types in one notification.
+        let stopped = parse_online_measurement_stopped(&[0xF1, 0x03, 0x02, 0x05]).unwrap();
+        assert_eq!(
+            stopped,
+            vec![MeasurementType::Ppi, MeasurementType::Acc, MeasurementType::Gyro]
+        );
+    }
+
+    #[test]
+    fn ignores_non_stop_notifications() {
+        assert!(parse_online_measurement_stopped(&[0xF0, 0x02]).is_none());
+        assert!(parse_online_measurement_stopped(&[]).is_none());
     }
 }
