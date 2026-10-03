@@ -31,6 +31,7 @@ use futures::stream::StreamExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
@@ -48,6 +49,11 @@ pub(crate) struct Connection {
 
 struct ConnectionInner {
     device: Peripheral,
+    /// Budget for every individual BLE operation on this connection (writes,
+    /// subscription changes, control point responses, PFTP frames). No
+    /// operation waits longer than this, so a stalled link surfaces as an error
+    /// instead of hanging forever.
+    timeout: Duration,
     /// Send sides of the notification router, keyed by characteristic UUID.
     /// A UUID maps to every consumer subscribed to it, each identified by a
     /// unique token; each notification is fanned out to all of them.
@@ -106,14 +112,28 @@ impl Drop for Subscription {
 
 impl Connection {
     /// Connects to `device`, discovers services, and starts the dispatcher.
-    pub(crate) async fn connect(central: &Adapter, device: Peripheral) -> PolarResult<Connection> {
-        device.connect().await.map_err(Error::BleError)?;
-        device.discover_services().await.map_err(Error::BleError)?;
+    ///
+    /// `timeout` bounds the connect and service-discovery calls as well as every
+    /// later operation on this connection.
+    pub(crate) async fn connect(
+        central: &Adapter,
+        device: Peripheral,
+        timeout: Duration,
+    ) -> PolarResult<Connection> {
+        tokio::time::timeout(timeout, device.connect())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(Error::BleError)?;
+        tokio::time::timeout(timeout, device.discover_services())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(Error::BleError)?;
 
         let (disconnected, _) = broadcast::channel(1);
 
         let inner = Arc::new(ConnectionInner {
             device,
+            timeout,
             routes: Mutex::new(HashMap::new()),
             control_point: tokio::sync::Mutex::new(()),
             next_token: AtomicU64::new(0),
@@ -121,10 +141,9 @@ impl Connection {
             tasks: Mutex::new(Vec::new()),
         });
 
-        let notifications = inner
-            .device
-            .notifications()
+        let notifications = tokio::time::timeout(timeout, inner.device.notifications())
             .await
+            .map_err(|_| Error::Timeout)?
             .map_err(Error::BleError)?;
         let dispatcher = tokio::spawn(dispatch_notifications(notifications, inner.clone()));
 
@@ -148,6 +167,11 @@ impl Connection {
         &self.inner.device
     }
 
+    /// The per-operation timeout configured when the connection was opened.
+    pub(crate) fn timeout(&self) -> Duration {
+        self.inner.timeout
+    }
+
     /// Returns whether the device is currently connected.
     pub(crate) async fn is_connected(&self) -> bool {
         self.inner.device.is_connected().await.unwrap_or(false)
@@ -167,10 +191,9 @@ impl Connection {
         let already_subscribed = self.inner.routes.lock().unwrap().contains_key(&uuid);
         if !already_subscribed {
             let characteristic = crate::find_characteristic(&self.inner.device, uuid).await?;
-            self.inner
-                .device
-                .subscribe(&characteristic)
+            tokio::time::timeout(self.inner.timeout, self.inner.device.subscribe(&characteristic))
                 .await
+                .map_err(|_| Error::Timeout)?
                 .map_err(Error::BleError)?;
         }
 
@@ -241,7 +264,10 @@ impl Connection {
                 .find(|c| c.uuid == uuid)
                 .cloned()
             {
-                if let Err(err) = self.inner.device.unsubscribe(&characteristic).await {
+                let unsubscribed =
+                    tokio::time::timeout(self.inner.timeout, self.inner.device.unsubscribe(&characteristic))
+                        .await;
+                if let Err(err) = unsubscribed {
                     log::debug!("arctic: unsubscribe {uuid} failed: {err:?}");
                 }
             }
@@ -258,12 +284,26 @@ impl Connection {
         self.inner.control_point.lock().await
     }
 
+    /// Registers a background task that must be aborted when the connection is
+    /// torn down.
+    ///
+    /// Stream tasks are spawned by [`crate::stream::start`] and would otherwise
+    /// only stop once their consumer drops the returned stream. Registering them
+    /// here means [`Connection::disconnect`] aborts them immediately, so the
+    /// connection's `Peripheral` is released and the BLE link actually closes.
+    /// Without this a disconnected stream task can keep the link open, and a
+    /// later reconnect leaves two live links to the same device — the device
+    /// then streams every frame to both.
+    pub(crate) fn register_task(&self, task: tokio::task::JoinHandle<()>) {
+        self.inner.tasks.lock().unwrap().push(task);
+    }
+
     /// Disconnects from the device and stops the background tasks.
     pub(crate) async fn disconnect(&self) {
         for task in self.inner.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
-        let _ = self.inner.device.disconnect().await;
+        let _ = tokio::time::timeout(self.inner.timeout, self.inner.device.disconnect()).await;
     }
 }
 

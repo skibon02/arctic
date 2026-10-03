@@ -303,6 +303,7 @@ async fn transfer(
 
     let mut rx = conn.subscribe(PSFTP_MTU_UUID).await?;
     let mut disconnected = conn.disconnected();
+    let timeout = conn.timeout();
 
     // Split the message into RFC76 frames and write them. The first frame has
     // the `next` bit clear; subsequent frames set it. The Polar PFTP MTU
@@ -321,10 +322,13 @@ async fn transfer(
         frame.push((seq << 4) | (status << 1) | next);
         frame.extend_from_slice(&message[offset..offset + chunk_len]);
 
-        conn.device()
-            .write(&mtu, &frame, WriteType::WithoutResponse)
-            .await
-            .map_err(Error::BleError)?;
+        tokio::time::timeout(
+            timeout,
+            conn.device().write(&mtu, &frame, WriteType::WithoutResponse),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(Error::BleError)?;
 
         offset += chunk_len;
         seq = (seq + 1) & 0x0F;
@@ -339,10 +343,11 @@ async fn transfer(
     loop {
         let data = tokio::select! {
             _ = disconnected.recv() => return Err(Error::Disconnected),
-            result = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()) => {
+            result = tokio::time::timeout(timeout, rx.recv()) => {
                 match result {
                     Ok(Some(data)) => data,
-                    Ok(None) | Err(_) => return Err(Error::InvalidData),
+                    Ok(None) => return Err(Error::Disconnected),
+                    Err(_) => return Err(Error::Timeout),
                 }
             }
         };

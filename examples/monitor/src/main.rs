@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sensor = PolarSensor::new("00000000".to_string()).await?;
 
     println!("Scanning for a Polar Verity Sense (max {}s)...", SCAN_TIMEOUT.as_secs());
-    sensor.discover_with_timeout(SCAN_TIMEOUT).await?;
+    sensor.discover(SCAN_TIMEOUT).await?;
     println!("Connected.");
 
     loop {

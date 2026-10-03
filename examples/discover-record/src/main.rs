@@ -11,6 +11,10 @@
 //! Usage: `cargo run -p discover-record`
 
 use arctic::{MeasurementType, PolarSensor};
+use std::time::Duration;
+
+/// How long the scan-and-connect attempt may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sensor = PolarSensor::new("00000000".to_string()).await?;
 
     println!("Scanning for a Polar Verity Sense...");
-    sensor.discover().await?;
+    sensor.discover(CONNECT_TIMEOUT).await?;
     println!("Connected to a Verity Sense.");
 
     if sensor.is_offline_recording_active(MeasurementType::Ppi).await? {

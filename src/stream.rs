@@ -107,10 +107,11 @@ pub(crate) async fn start(
     let factor = settings.factor();
 
     let (tx, rx) = mpsc::channel(16);
+    let task_conn = conn.clone();
     let conn = conn.clone();
 
     log::debug!("arctic: stream {ty:?} task started");
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut state = StreamState::default();
 
         loop {
@@ -169,6 +170,8 @@ pub(crate) async fn start(
             }
         }
     });
+
+    task_conn.register_task(task);
 
     Ok(ReceiverStream::new(rx).boxed())
 }

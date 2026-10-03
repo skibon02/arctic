@@ -8,6 +8,10 @@
 
 use arctic::{MeasurementType, PolarSensor, StreamFrame};
 use futures::stream::StreamExt;
+use std::time::Duration;
+
+/// How long the scan-and-connect attempt may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sensor = PolarSensor::new(device_id).await?;
 
     println!("Connecting...");
-    sensor.connect().await?;
+    sensor.connect(CONNECT_TIMEOUT).await?;
     println!("Connected.");
 
     // Discover the available settings and select one of each. PPI has no

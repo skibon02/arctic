@@ -12,12 +12,14 @@
 //! ```rust,no_run
 //! use arctic::{PolarSensor, MeasurementType, StreamFrame};
 //! use futures::stream::StreamExt;
+//! use std::time::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create a new PolarSensor with the device ID written on the device.
 //!     let mut sensor = PolarSensor::new("7B45F72B".to_string()).await?;
-//!     sensor.connect().await?;
+//!     // Bound the scan-and-connect attempt so it cannot hang.
+//!     sensor.connect(Duration::from_secs(5)).await?;
 //!
 //!     // Discover the available stream settings, then select one of each.
 //!     let mut settings = sensor.request_stream_settings(MeasurementType::Acc).await?;
@@ -91,6 +93,8 @@ pub enum Error {
     NoBleAdaptor,
     /// Could not find a device when trying to connect
     NoDevice,
+    /// An operation did not complete within the configured timeout
+    Timeout,
     /// Device is not connected, but function was called that requires it
     NotConnected,
     /// The device disconnected during an operation
@@ -118,6 +122,7 @@ impl fmt::Display for Error {
         let msg = match self {
             Error::NoBleAdaptor => "No BLE adaptor".to_string(),
             Error::NoDevice => "No device".to_string(),
+            Error::Timeout => "Operation timed out".to_string(),
             Error::NotConnected => "Not connected".to_string(),
             Error::Disconnected => "Device disconnected".to_string(),
             Error::StreamStopped => "Device stopped the stream".to_string(),
@@ -174,27 +179,18 @@ impl PolarSensor {
     /// Scans for the first Polar Verity Sense and connects to it, regardless of
     /// the device id this instance was created with.
     ///
-    /// # Errors
-    ///
-    /// Returns a [`Error::BleError`] if the bluetooth adapter, scan, or service
-    /// discovery fails. Returns [`Error::NoBleAdaptor`] if no adapters are
-    /// available, and [`Error::NoDevice`] if no Verity Sense was found.
-    pub async fn discover(&mut self) -> PolarResult<()> {
-        self.discover_with_timeout(Duration::from_secs(10)).await
-    }
-
-    /// Scans for the first Polar Verity Sense for at most `timeout` and
-    /// connects to it, regardless of the device id this instance was created
-    /// with.
+    /// `timeout` bounds the whole operation: the scan, the connect, and service
+    /// discovery. If it elapses the attempt fails with [`Error::Timeout`] or
+    /// [`Error::NoDevice`] rather than hanging.
     ///
     /// # Errors
     ///
     /// Returns a [`Error::BleError`] if the bluetooth adapter, scan, or service
     /// discovery fails. Returns [`Error::NoBleAdaptor`] if no adapters are
-    /// available, and [`Error::NoDevice`] if no Verity Sense was found within
-    /// `timeout`.
-    pub async fn discover_with_timeout(&mut self, timeout: Duration) -> PolarResult<()> {
-        let central = self.scan().await?;
+    /// available, [`Error::NoDevice`] if no Verity Sense was found, and
+    /// [`Error::Timeout`] if the operation exceeded `timeout`.
+    pub async fn discover(&mut self, timeout: Duration) -> PolarResult<()> {
+        let central = self.scan(timeout).await?;
 
         let device = self
             .find_device_by(&central, |name| name.starts_with("Polar Sense"), timeout)
@@ -207,27 +203,32 @@ impl PolarSensor {
         let device = device.ok_or(Error::NoDevice)?;
 
         log::info!("arctic: connecting to device...");
-        self.connection = Some(connection::Connection::connect(&central, device).await?);
+        self.connection = Some(connection::Connection::connect(&central, device, timeout).await?);
         log::info!("arctic: connected");
         Ok(())
     }
 
     /// Finds and connects to the device id associated with this instance.
     ///
+    /// `timeout` bounds the whole operation: the scan, the connect, and service
+    /// discovery. If it elapses the attempt fails with [`Error::Timeout`] or
+    /// [`Error::NoDevice`] rather than hanging.
+    ///
     /// # Errors
     ///
     /// Returns a [`Error::BleError`] if the bluetooth adapter, scan, or service
     /// discovery fails. Returns [`Error::NoBleAdaptor`] if no adapters are
-    /// available, and [`Error::NoDevice`] if the device was not found.
-    pub async fn connect(&mut self) -> PolarResult<()> {
-        let central = self.scan().await?;
+    /// available, [`Error::NoDevice`] if the device was not found, and
+    /// [`Error::Timeout`] if the operation exceeded `timeout`.
+    pub async fn connect(&mut self, timeout: Duration) -> PolarResult<()> {
+        let central = self.scan(timeout).await?;
         let device_id = self.device_id.clone();
 
         let device = self
             .find_device_by(
                 &central,
                 move |name| name.starts_with("Polar") && name.ends_with(&device_id),
-                Duration::from_secs(10),
+                timeout,
             )
             .await;
 
@@ -237,7 +238,7 @@ impl PolarSensor {
         let _ = central.stop_scan().await;
         let device = device.ok_or(Error::NoDevice)?;
 
-        self.connection = Some(connection::Connection::connect(&central, device).await?);
+        self.connection = Some(connection::Connection::connect(&central, device, timeout).await?);
         Ok(())
     }
 
@@ -477,21 +478,29 @@ impl PolarSensor {
     /// Scans for and returns all matching Polar devices (name and device id).
     ///
     /// The device id is the trailing 8-character suffix of the advertised name.
-    /// The scan runs for a short period so that nearby devices can be discovered.
+    /// The scan runs for `timeout` so that nearby devices can be discovered.
     ///
     /// # Errors
     ///
     /// Returns [`Error::BleError`] if the adapter or scan fails, or
     /// [`Error::NoBleAdaptor`] if no adapters are available.
-    pub async fn list_devices(&self) -> PolarResult<Vec<(String, String)>> {
-        let central = self.scan().await?;
+    pub async fn list_devices(&self, timeout: Duration) -> PolarResult<Vec<(String, String)>> {
+        let central = self.scan(timeout).await?;
 
-        // Give the adapter a moment to discover nearby devices.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Let the adapter discover nearby devices for the scan duration.
+        tokio::time::sleep(timeout).await;
 
         let mut devices = Vec::new();
-        for p in central.peripherals().await.map_err(Error::BleError)? {
-            if let Some(props) = p.properties().await.map_err(Error::BleError)? {
+        let peripherals = tokio::time::timeout(timeout, central.peripherals())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(Error::BleError)?;
+        for p in peripherals {
+            let props = tokio::time::timeout(timeout, p.properties())
+                .await
+                .map_err(|_| Error::Timeout)?
+                .map_err(Error::BleError)?;
+            if let Some(props) = props {
                 if let Some(name) = props.local_name {
                     if name.starts_with("Polar") {
                         if let Some(id) = name.split_whitespace().last() {
@@ -505,7 +514,7 @@ impl PolarSensor {
         }
 
         // Stop the scan so repeated listings do not leave scans running.
-        let _ = central.stop_scan().await;
+        let _ = tokio::time::timeout(timeout, central.stop_scan()).await;
 
         Ok(devices)
     }
@@ -516,16 +525,19 @@ impl PolarSensor {
     }
 
     /// Starts a scan on the first available adapter.
-    async fn scan(&self) -> PolarResult<Adapter> {
-        let adapters = self.ble_manager.adapters().await.map_err(Error::BleError)?;
+    async fn scan(&self, timeout: Duration) -> PolarResult<Adapter> {
+        let adapters = tokio::time::timeout(timeout, self.ble_manager.adapters())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(Error::BleError)?;
         if adapters.is_empty() {
             return Err(Error::NoBleAdaptor);
         }
 
         let central = adapters.into_iter().next().unwrap();
-        central
-            .start_scan(ScanFilter::default())
+        tokio::time::timeout(timeout, central.start_scan(ScanFilter::default()))
             .await
+            .map_err(|_| Error::Timeout)?
             .map_err(Error::BleError)?;
 
         Ok(central)
@@ -543,11 +555,14 @@ impl PolarSensor {
     where
         F: Fn(&str) -> bool,
     {
-        let mut events = central.events().await.ok()?;
+        let mut events = tokio::time::timeout(timeout, central.events())
+            .await
+            .ok()?
+            .ok()?;
         let deadline = time::Instant::now() + timeout;
 
         // Check peripherals already discovered before subscribing to events.
-        if let Some(device) = matching_peripheral(central, &predicate).await {
+        if let Some(device) = matching_peripheral(central, &predicate, timeout).await {
             return Some(device);
         }
 
@@ -568,7 +583,7 @@ impl PolarSensor {
                 _ => continue,
             }
 
-            if let Some(device) = matching_peripheral(central, &predicate).await {
+            if let Some(device) = matching_peripheral(central, &predicate, timeout).await {
                 return Some(device);
             }
         }
@@ -577,12 +592,21 @@ impl PolarSensor {
 
 /// Returns the first peripheral whose advertised local name matches
 /// `predicate`.
-async fn matching_peripheral<F>(central: &Adapter, predicate: &F) -> Option<Peripheral>
+async fn matching_peripheral<F>(
+    central: &Adapter,
+    predicate: &F,
+    timeout: Duration,
+) -> Option<Peripheral>
 where
     F: Fn(&str) -> bool,
 {
-    for p in central.peripherals().await.ok()? {
-        if let Some(props) = p.properties().await.ok().flatten() {
+    let peripherals = tokio::time::timeout(timeout, central.peripherals())
+        .await
+        .ok()?
+        .ok()?;
+    for p in peripherals {
+        let props = tokio::time::timeout(timeout, p.properties()).await.ok()?.ok()?;
+        if let Some(props) = props {
             if props.local_name.iter().any(|name| predicate(name)) {
                 return Some(p);
             }

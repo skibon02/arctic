@@ -6,6 +6,10 @@
 //! The device ID is the 8-character code written on the device.
 
 use arctic::PolarSensor;
+use std::time::Duration;
+
+/// How long the scan-and-connect attempt may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sensor = PolarSensor::new(device_id).await?;
 
     println!("Connecting...");
-    sensor.connect().await?;
+    sensor.connect(CONNECT_TIMEOUT).await?;
     println!("Connected.");
 
     println!("Listing recordings...");

@@ -5,6 +5,10 @@
 //! The device ID is the 8-character code written on the device.
 
 use arctic::{MeasurementType, PolarSensor};
+use std::time::Duration;
+
+/// How long each scan-and-connect attempt may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting...");
     while !sensor.is_connected().await {
-        match sensor.connect().await {
+        match sensor.connect(CONNECT_TIMEOUT).await {
             Ok(()) => {}
             Err(arctic::Error::NoBleAdaptor) => {
                 eprintln!("No bluetooth adapter found");

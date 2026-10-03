@@ -165,10 +165,11 @@ async fn await_response(
 ) -> PolarResult<ControlResponse> {
     let characteristic = crate::find_characteristic(conn.device(), PMD_CP_UUID).await?;
     let mut disconnected = conn.disconnected();
+    let timeout = conn.timeout();
 
-    conn.device()
-        .write(&characteristic, command, WriteType::WithResponse)
+    tokio::time::timeout(timeout, conn.device().write(&characteristic, command, WriteType::WithResponse))
         .await
+        .map_err(|_| Error::Timeout)?
         .map_err(Error::BleError)?;
 
     loop {
@@ -176,7 +177,7 @@ async fn await_response(
             _ = disconnected.recv() => {
                 return Err(Error::Disconnected);
             }
-            notification = tokio::time::timeout(std::time::Duration::from_secs(10), cp_rx.recv()) => {
+            notification = tokio::time::timeout(timeout, cp_rx.recv()) => {
                 match notification {
                     Ok(Some(value)) => {
                         log::debug!("arctic: send_command: response={:02x?}", value);
@@ -190,7 +191,7 @@ async fn await_response(
                     }
                     Err(_) => {
                         log::error!("arctic: send_command: timed out waiting for response");
-                        return Err(Error::InvalidData);
+                        return Err(Error::Timeout);
                     }
                 }
             }
