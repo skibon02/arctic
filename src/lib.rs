@@ -198,12 +198,13 @@ impl PolarSensor {
 
         let device = self
             .find_device_by(&central, |name| name.starts_with("Polar Sense"), timeout)
-            .await
-            .ok_or(Error::NoDevice)?;
+            .await;
 
         // Stop scanning before connecting; an active scan interferes with the
-        // connection on some platforms.
+        // connection on some platforms. Stop it on the not-found path too, so a
+        // failed attempt does not leave a scan running on the adapter.
         let _ = central.stop_scan().await;
+        let device = device.ok_or(Error::NoDevice)?;
 
         log::info!("arctic: connecting to device...");
         self.connection = Some(connection::Connection::connect(&central, device).await?);
@@ -228,12 +229,13 @@ impl PolarSensor {
                 move |name| name.starts_with("Polar") && name.ends_with(&device_id),
                 Duration::from_secs(10),
             )
-            .await
-            .ok_or(Error::NoDevice)?;
+            .await;
 
         // Stop scanning before connecting; an active scan interferes with the
-        // connection on some platforms.
+        // connection on some platforms. Stop it on the not-found path too, so a
+        // failed attempt does not leave a scan running on the adapter.
         let _ = central.stop_scan().await;
+        let device = device.ok_or(Error::NoDevice)?;
 
         self.connection = Some(connection::Connection::connect(&central, device).await?);
         Ok(())
@@ -501,6 +503,9 @@ impl PolarSensor {
                 }
             }
         }
+
+        // Stop the scan so repeated listings do not leave scans running.
+        let _ = central.stop_scan().await;
 
         Ok(devices)
     }
