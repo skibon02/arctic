@@ -56,6 +56,7 @@ use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFi
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::{BoxStream, StreamExt};
 use std::fmt;
+use tokio::sync::OnceCell;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
@@ -71,19 +72,48 @@ pub use stream::StreamFrame;
 /// environment before any Bluetooth operation. This binds the given `JavaVM`
 /// pointer into btleplug's global state and registers its native callbacks.
 ///
+/// `activity` must be a pointer to the hosting `android.app.Activity`. On a
+/// NativeActivity the JNI `FindClass` uses the boot class loader, which cannot
+/// see the app's `classes.dex` where btleplug's Java shim lives. btleplug
+/// resolves its shim through the current thread's context class loader first,
+/// so the activity's class loader is installed as that loader before
+/// initialization.
+///
 /// Must be called once, before constructing a [`PolarSensor`].
 ///
 /// # Safety
 ///
-/// `vm` must be a valid pointer to a `JavaVM` for the lifetime of the process.
+/// `vm` must be a valid pointer to a `JavaVM` and `activity` a valid pointer to
+/// an `android.app.Activity`, both for the lifetime of the process.
 #[cfg(target_os = "android")]
-pub fn init_android(vm: *mut std::ffi::c_void) -> PolarResult<()> {
+pub fn init_android(
+    vm: *mut std::ffi::c_void,
+    activity: *mut std::ffi::c_void,
+) -> PolarResult<()> {
+    use jni::objects::{JClassLoader, JObject, JThread};
     use jni::JavaVM;
 
     let vm = unsafe { JavaVM::from_raw(vm as *mut jni::sys::JavaVM) };
 
-    vm.attach_current_thread(|env| btleplug::platform::init(env))
-        .map_err(Error::BleError)
+    vm.attach_current_thread(|env| {
+        // Context.getClassLoader() returns the app class loader, which sees the
+        // classes.dex bundled in the APK. (activity.getClass().getClassLoader()
+        // would return the boot loader since NativeActivity is a system class.)
+        let activity = unsafe { JObject::from_raw(env, activity as jni::sys::jobject) };
+        let loader_obj = env
+            .call_method(
+                &activity,
+                jni::jni_str!("getClassLoader"),
+                jni::jni_sig!("()Ljava/lang/ClassLoader;"),
+                &[],
+            )?
+            .l()?;
+        let loader = JClassLoader::cast_local(env, loader_obj)?;
+        JThread::current_thread(env)?.set_context_class_loader(env, &loader)?;
+
+        btleplug::platform::init(env)
+    })
+    .map_err(Error::BleError)
 }
 
 /// Error type for general errors and BLE errors from btleplug
@@ -143,6 +173,24 @@ impl std::error::Error for Error {}
 /// Result simplification type
 pub type PolarResult<T> = std::result::Result<T, Error>;
 
+/// The process-wide btleplug manager.
+///
+/// On the BlueZ backend each `Manager::new()` opens a fresh private connection
+/// to the D-Bus system bus, and btleplug keeps that connection alive in a
+/// detached task that never finishes. Creating a manager per [`PolarSensor`]
+/// therefore leaks one D-Bus connection per sensor until dbus-daemon refuses
+/// new ones with `LimitsExceeded`. A single shared manager keeps exactly one
+/// D-Bus connection alive for the whole process.
+static BLE_MANAGER: OnceCell<Manager> = OnceCell::const_new();
+
+/// Returns the shared btleplug manager, creating it on first use.
+async fn ble_manager() -> PolarResult<Manager> {
+    BLE_MANAGER
+        .get_or_try_init(|| async { Manager::new().await.map_err(Error::BleError) })
+        .await
+        .cloned()
+}
+
 /// The core Polar device structure. Keeps track of connection and offline
 /// recording operations.
 pub struct PolarSensor {
@@ -163,7 +211,7 @@ impl PolarSensor {
     /// created, or [`Error::InvalidLength`] if the device id is not 8
     /// characters long.
     pub async fn new(device_id: String) -> PolarResult<PolarSensor> {
-        let ble_manager = Manager::new().await.map_err(Error::BleError)?;
+        let ble_manager = ble_manager().await?;
 
         if device_id.len() != 8 {
             return Err(Error::InvalidLength);
@@ -452,8 +500,7 @@ impl PolarSensor {
 
         let stream = async_stream::stream! {
             while let Some(value) = rx.recv().await {
-                // Heart Rate Measurement: [flags, bpm, ...]. BPM is the second byte.
-                if let Some(bpm) = value.get(1).copied() {
+                if let Some(bpm) = parse_heart_rate_measurement(&value) {
                     yield bpm;
                 }
             }
@@ -473,6 +520,53 @@ impl PolarSensor {
             .release_all(polar_uuid::HEART_RATE_MEASUREMENT_UUID)
             .await;
         Ok(())
+    }
+
+    /// Reads the device battery level as a percentage (0-100).
+    ///
+    /// Uses the standard Battery Service (`0x180F`) level characteristic
+    /// (`0x2A19`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected,
+    /// [`Error::CharacteristicNotFound`] if the device has no battery level
+    /// characteristic, or [`Error::BleError`] if the read fails.
+    pub async fn battery_level(&self) -> PolarResult<u8> {
+        let conn = self.connection()?;
+        let characteristic =
+            find_characteristic(conn.device(), polar_uuid::BATTERY_LEVEL_UUID).await?;
+        let value = tokio::time::timeout(conn.timeout(), conn.device().read(&characteristic))
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(Error::BleError)?;
+        value.first().copied().ok_or(Error::InvalidLength)
+    }
+
+    /// Subscribes to battery level notifications and returns a stream of
+    /// percentages (0-100).
+    ///
+    /// The device pushes a new value when the level changes, so the stream stays
+    /// current without polling. It ends when the device disconnects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotConnected`] if not connected,
+    /// [`Error::CharacteristicNotFound`] if the device has no battery level
+    /// characteristic, or [`Error::BleError`] if the subscription fails.
+    pub async fn start_battery_streaming(&self) -> PolarResult<BoxStream<'static, u8>> {
+        let conn = self.connection()?;
+        let mut rx = conn.subscribe(polar_uuid::BATTERY_LEVEL_UUID).await?;
+
+        let stream = async_stream::stream! {
+            while let Some(value) = rx.recv().await {
+                if let Some(level) = value.first().copied() {
+                    yield level;
+                }
+            }
+        };
+
+        Ok(stream.boxed())
     }
 
     /// Scans for and returns all matching Polar devices (name and device id).
@@ -614,6 +708,23 @@ where
     }
 
     None
+}
+
+/// Parses a standard BLE Heart Rate Measurement value into beats per minute.
+///
+/// Layout is `[flags, hr, ...]`. Flag bit 0 selects the HR value format: 0 for
+/// a single `u8` byte, 1 for a little-endian `u16`. Returns `None` if the value
+/// is too short to hold the HR field.
+fn parse_heart_rate_measurement(value: &[u8]) -> Option<u8> {
+    let flags = *value.first()?;
+    let hr_format_u16 = flags & 0x01 != 0;
+    if hr_format_u16 {
+        let low = *value.get(1)?;
+        let high = *value.get(2)?;
+        Some(u16::from_le_bytes([low, high]).min(255) as u8)
+    } else {
+        value.get(1).copied()
+    }
 }
 
 /// Private helper to find characteristics from a [`Uuid`]

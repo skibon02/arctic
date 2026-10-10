@@ -17,7 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 async-stream = "0.3"
-btleplug = { version = "0.13.3" }
+btleplug = { git = "ssh://git@github.com/skibon02/btleplug.git", rev = "d8e118e" }
 futures = "0.3"
 log = "0.4"
 tokio = { version = "1.10.0", features = ["macros", "rt", "rt-multi-thread", "time"] }
