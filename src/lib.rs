@@ -191,6 +191,16 @@ async fn ble_manager() -> PolarResult<Manager> {
         .cloned()
 }
 
+/// One notification from the standard Heart Rate Measurement characteristic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeartRateMeasurement {
+    /// Heart rate in beats per minute.
+    pub bpm: u8,
+    /// Time between consecutive beats in milliseconds, oldest first. Empty when
+    /// the sensor did not include RR intervals in this notification.
+    pub rr_intervals_ms: Vec<f64>,
+}
+
 /// The core Polar device structure. Keeps track of connection and offline
 /// recording operations.
 pub struct PolarSensor {
@@ -481,18 +491,21 @@ impl PolarSensor {
         control::stop_measurement(self.connection()?, ty).await
     }
 
-    /// Starts standard BLE Heart Rate streaming and returns a stream of BPM
-    /// values.
+    /// Starts standard BLE Heart Rate streaming and returns a stream of
+    /// measurements.
     ///
     /// Unlike PMD streaming, this uses the standard Heart Rate Service
-    /// (`0x180D`) measurement characteristic (`0x2A37`), which delivers only the
-    /// current heart rate in beats per minute with no pulse-to-pulse intervals.
+    /// (`0x180D`) measurement characteristic (`0x2A37`). Each notification
+    /// carries the heart rate and, when the sensor reports them, the RR
+    /// intervals (time between consecutive beats) for that notification.
     ///
     /// # Errors
     ///
     /// Returns [`Error::NotConnected`] if not connected, or
     /// [`Error::BleError`] if the subscription fails.
-    pub async fn start_hr_streaming(&self) -> PolarResult<BoxStream<'static, u8>> {
+    pub async fn start_hr_streaming(
+        &self,
+    ) -> PolarResult<BoxStream<'static, HeartRateMeasurement>> {
         let conn = self.connection()?;
         let mut rx = conn
             .subscribe(polar_uuid::HEART_RATE_MEASUREMENT_UUID)
@@ -500,8 +513,8 @@ impl PolarSensor {
 
         let stream = async_stream::stream! {
             while let Some(value) = rx.recv().await {
-                if let Some(bpm) = parse_heart_rate_measurement(&value) {
-                    yield bpm;
+                if let Some(measurement) = parse_heart_rate_measurement(&value) {
+                    yield measurement;
                 }
             }
         };
@@ -710,21 +723,42 @@ where
     None
 }
 
-/// Parses a standard BLE Heart Rate Measurement value into beats per minute.
+/// Parses a standard BLE Heart Rate Measurement value.
 ///
-/// Layout is `[flags, hr, ...]`. Flag bit 0 selects the HR value format: 0 for
-/// a single `u8` byte, 1 for a little-endian `u16`. Returns `None` if the value
-/// is too short to hold the HR field.
-fn parse_heart_rate_measurement(value: &[u8]) -> Option<u8> {
+/// Layout is `[flags, hr, (energy_expended u16)?, (rr u16)*]`. Flag bit 0
+/// selects the HR format (0: `u8`, 1: little-endian `u16`), bit 3 marks a
+/// present Energy Expended field, and bit 4 marks RR intervals, each a
+/// little-endian `u16` in 1/1024 s. Returns `None` if the HR field is missing.
+fn parse_heart_rate_measurement(value: &[u8]) -> Option<HeartRateMeasurement> {
     let flags = *value.first()?;
     let hr_format_u16 = flags & 0x01 != 0;
-    if hr_format_u16 {
+    let energy_present = flags & 0x08 != 0;
+    let rr_present = flags & 0x10 != 0;
+
+    let (bpm, mut rest) = if hr_format_u16 {
         let low = *value.get(1)?;
         let high = *value.get(2)?;
-        Some(u16::from_le_bytes([low, high]).min(255) as u8)
+        (u16::from_le_bytes([low, high]).min(255) as u8, value.get(3..)?)
     } else {
-        value.get(1).copied()
+        (*value.get(1)?, value.get(2..)?)
+    };
+
+    if energy_present {
+        rest = rest.get(2..)?;
     }
+
+    let rr_intervals_ms = if rr_present {
+        rest.chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]) as f64 * 1000.0 / 1024.0)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Some(HeartRateMeasurement {
+        bpm,
+        rr_intervals_ms,
+    })
 }
 
 /// Private helper to find characteristics from a [`Uuid`]
